@@ -482,7 +482,7 @@ def _apply_audit_logging(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
     if hasattr(mcp, "_tool_manager"):
         # FastMCP 2.x
         try:
-            for name, tool in mcp._tool_manager._tools.items():
+            for name, tool in mcp._tool_manager._tools.items():  # type: ignore[unresolved-attribute]  # FastMCP 2.x internal; guarded by hasattr
                 if name in _AUDITABLE_MCP_TOOLS:
                     object.__setattr__(tool, "run", _wrap_tool_run(name, tool.run))
         except (AttributeError, KeyError) as e:
@@ -2873,6 +2873,7 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                 result = await memory.delete_bank(
                     target_bank,
                     fact_type=type,
+                    delete_bank_profile=False,
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"status": "cleared", "bank_id": target_bank, **result}, default=str)
@@ -2905,6 +2906,7 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                 result = await memory.delete_bank(
                     target_bank,
                     fact_type=type,
+                    delete_bank_profile=False,
                     request_context=_get_request_context(config),
                 )
                 return {"status": "cleared", "bank_id": target_bank, **result}
