@@ -4781,39 +4781,58 @@ def _register_routes(app: FastAPI):
         bank_id: str, request: RetainRequest, request_context: RequestContext = Depends(get_request_context)
     ):
         """Retain memories with optional async processing."""
+        # 获取指标采集器，用于记录 retain 接口的运行指标。
         metrics = get_metrics_collector()
 
         try:
-            # Group items by strategy
+            # 按 strategy 对请求中的条目分组，便于后续分别提交或处理。
             strategy_groups: dict[str | None, list[dict]] = {}
+            # 遍历本次请求中的每一条 memory item。
             for item in request.items:
+                # 取出该条目声明的 retain 策略；如果未指定则为 None。
                 effective = item.strategy
+                # 如果这个策略分组还不存在，先初始化一个空列表。
                 if effective not in strategy_groups:
                     strategy_groups[effective] = []
+                # 先构造 retain 所需的基础 payload，content 是必填字段。
                 content_dict: dict = {"content": item.content}
+                # 特殊值 "unset" 表示显式写入“无时间”，因此传 None 给 event_date。
                 if item.timestamp == "unset":
                     content_dict["event_date"] = None
+                # 否则如果有时间戳，就把它映射为底层 retain 使用的 event_date。
                 elif item.timestamp:
                     content_dict["event_date"] = item.timestamp
+                # 只有在请求里传了 context 时才附加，避免写入空值。
                 if item.context:
                     content_dict["context"] = item.context
+                # 如果有 metadata，一并透传到底层 retain 流程。
                 if item.metadata:
                     content_dict["metadata"] = item.metadata
+                # 如果指定了 document_id，就把该记忆挂到对应文档下。
                 if item.document_id:
                     content_dict["document_id"] = item.document_id
+                # 如果调用方显式传入 entities，就转换成 retain 层需要的结构。
                 if item.entities:
+                    # 未指定实体类型时默认使用 CONCEPT，保证下游结构完整。
                     content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
+                # 如果设置了 tags，则附加到 payload 中用于可见性/过滤。
                 if item.tags:
                     content_dict["tags"] = item.tags
+                # observation_scopes 允许传 None 以外的任意合法值，因此这里显式判空。
                 if item.observation_scopes is not None:
                     content_dict["observation_scopes"] = item.observation_scopes
+                # 将当前条目加入对应策略分组，后续按组统一处理。
                 strategy_groups[effective].append(content_dict)
 
+            # 如果请求要求异步处理，则把每个策略分组分别投递到后台任务系统。
             if request.async_:
-                # Async processing: one submit per strategy group
+                # 收集所有后台 operation_id，便于返回给调用方追踪状态。
                 all_operation_ids = []
+                # 统计所有分组实际提交的条目总数。
                 total_items_count = 0
+                # 逐个策略分组提交异步 retain 任务。
                 for group_strategy, contents in strategy_groups.items():
+                    # 提交当前策略分组到后台队列，由 worker 异步处理。
                     result = await app.state.memory.submit_async_retain(
                         bank_id,
                         contents,
@@ -4821,8 +4840,11 @@ def _register_routes(app: FastAPI):
                         strategy=group_strategy,
                         request_context=request_context,
                     )
+                    # 保存后台任务 ID，供 API 响应返回。
                     all_operation_ids.append(result["operation_id"])
+                    # 累加当前分组提交的条目数。
                     total_items_count += result["items_count"]
+                # 构造异步 retain 的标准响应；多个策略分组时返回 operation_ids 列表。
                 return RetainResponse.model_validate(
                     {
                         "success": True,
@@ -4834,10 +4856,12 @@ def _register_routes(app: FastAPI):
                     }
                 )
             else:
-                # Check if batch API is enabled - if so, require async mode
+                # 同步模式下先读取配置，判断当前服务是否强制要求批处理走异步。
                 from hindsight_api.config import get_config
 
+                # 获取当前运行时配置。
                 config = get_config()
+                # 当批处理 API 开启时，同步 retain 可能执行过久，因此直接拒绝并提示改用 async。
                 if config.retain_batch_enabled:
                     raise HTTPException(
                         status_code=400,
@@ -4849,11 +4873,15 @@ def _register_routes(app: FastAPI):
                         ),
                     )
 
-                # Synchronous processing: one batch per strategy group, aggregate results
+                # 同步模式下，按策略分组逐批处理，并把结果汇总成一次响应。
                 total_items_count = 0
+                # 初始化总 token 用量统计，后续把各分组 usage 累加起来。
                 total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
+                # 在指标上下文中记录本次 retain API 调用。
                 with metrics.record_operation("retain", bank_id=bank_id, source="api"):
+                    # 逐个策略分组调用同步 retain 流程。
                     for group_strategy, contents in strategy_groups.items():
+                        # 同步执行当前分组的 retain，并要求返回 usage 统计信息。
                         result, usage = await app.state.memory.retain_batch_async(
                             bank_id=bank_id,
                             contents=contents,
@@ -4868,7 +4896,9 @@ def _register_routes(app: FastAPI):
                                 schema=_current_schema.get(),
                             ),
                         )
+                        # 当前分组成功处理后，把条目数计入总数。
                         total_items_count += len(contents)
+                        # 如果当前分组返回了 usage，就把 token 统计累加到总 usage。
                         if usage:
                             total_usage = TokenUsage(
                                 input_tokens=total_usage.input_tokens + usage.input_tokens,
@@ -4876,6 +4906,7 @@ def _register_routes(app: FastAPI):
                                 total_tokens=total_usage.total_tokens + usage.total_tokens,
                             )
 
+                # 构造同步 retain 的标准响应，并返回累计 usage。
                 return RetainResponse.model_validate(
                     {
                         "success": True,
@@ -4885,28 +4916,38 @@ def _register_routes(app: FastAPI):
                         "usage": total_usage,
                     }
                 )
+        # 把领域层校验错误转换成对应的 HTTP 状态码和错误信息。
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        # 认证错误和已经构造好的 HTTPException 直接向上抛出，保持原始语义。
         except (AuthenticationError, HTTPException):
             raise
+        # 其他未预期异常统一记录详细日志，并向客户端返回 500。
         except Exception as e:
             import traceback
 
-            # Create a summary of the input for debugging
+            # 为调试日志构造输入摘要，避免只看到异常却不知道触发数据是什么。
             input_summary = []
+            # 枚举原始请求条目，逐条生成可读的调试信息。
             for i, item in enumerate(request.items):
+                # 只截取前 100 个字符，避免日志中出现过长正文。
                 content_preview = item.content[:100] + "..." if len(item.content) > 100 else item.content
+                # 记录当前条目的核心字段，帮助排查是哪条输入触发了异常。
                 input_summary.append(
                     f"  [{i}] content={content_preview!r}, context={item.context}, timestamp={item.timestamp}"
                 )
+            # 将多条输入摘要拼接成一段日志文本。
             input_debug = "\n".join(input_summary)
 
+            # 组合异常消息、输入摘要和完整 traceback，便于后续排障。
             error_detail = (
                 f"{str(e)}\n\n"
                 f"Input ({len(request.items)} items):\n{input_debug}\n\n"
                 f"Traceback:\n{traceback.format_exc()}"
             )
+            # 把完整错误细节写入服务端日志。
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories (retain): {error_detail}")
+            # 对外只返回简化后的异常信息，避免泄露过多内部细节。
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(

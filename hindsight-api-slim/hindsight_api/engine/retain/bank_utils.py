@@ -113,8 +113,11 @@ async def get_bank_profile(pool, bank_id: str) -> BankProfile:
     Returns:
         BankProfile with name, typed DispositionTraits, and mission
     """
+    # 先记录一次调试日志，表明开始读取指定 bank 的 profile。
+    logger.debug("Fetching bank profile for bank_id=%s", bank_id)
+    # 从连接池中获取一个可重试的数据库连接，覆盖临时网络抖动等场景。
     async with acquire_with_retry(pool) as conn:
-        # Try to get existing bank
+        # 先尝试查询已存在的 bank 记录。
         row = await conn.fetchrow(
             f"""
             SELECT name, disposition, mission
@@ -123,22 +126,30 @@ async def get_bank_profile(pool, bank_id: str) -> BankProfile:
             bank_id,
         )
 
+        # 如果查到了记录，直接解析并返回已有 profile。
         if row:
-            # asyncpg returns JSONB as a string, so parse it
+            # asyncpg 对 JSONB 可能返回字符串，这里统一解析成 Python 对象。
             disposition_data = row["disposition"]
+            # 只有在确实是字符串时才需要 json.loads。
             if isinstance(disposition_data, str):
                 disposition_data = json.loads(disposition_data)
 
+            # 记录命中已有 bank 的调试日志。
+            logger.debug("Found existing bank profile for bank_id=%s", bank_id)
+            # 把数据库行转换成强类型的 BankProfile 返回给上层。
             return BankProfile(
                 name=row["name"],
                 disposition=DispositionTraits(**disposition_data),
                 mission=row["mission"] or "",
             )
 
-        # Bank doesn't exist, create with defaults.
-        # Generate internal_id here so we control the value and can use it
-        # immediately for HNSW index creation without a RETURNING round-trip.
+        # 如果 bank 不存在，就按默认值自动创建。
+        # internal_id 在这里预先生成，这样后面可以立刻拿它创建 per-bank 向量索引，
+        # 不需要额外再走一次 RETURNING 查询拿内部 ID。
+        logger.info("Bank profile not found for bank_id=%s; creating default bank row", bank_id)
+        # 为即将插入的新 bank 生成内部 UUID。
         internal_id = uuid.uuid4()
+        # 插入默认 bank；如果有并发请求同时创建同一个 bank，ON CONFLICT 会安全跳过。
         inserted = await conn.fetchval(
             f"""
             INSERT INTO {fq_table("banks")} (bank_id, name, disposition, mission, internal_id)
@@ -153,10 +164,17 @@ async def get_bank_profile(pool, bank_id: str) -> BankProfile:
             internal_id,
         )
 
+        # inserted 有值表示这次请求真正完成了新 bank 的插入。
         if inserted:
-            # Fresh insert — create per-bank vector indexes (instant on empty bank)
+            # 新 bank 插入成功后，立即创建该 bank 专属的向量索引。
+            # 空 bank 上建索引成本很低，因此这里同步做掉。
+            logger.info("Created bank row for bank_id=%s; creating per-bank vector indexes", bank_id)
             await create_bank_vector_indexes(conn, bank_id, str(internal_id))
+        else:
+            # 走到这里说明别的并发请求已经先一步创建好了同一个 bank。
+            logger.debug("Bank row for bank_id=%s was created concurrently by another request", bank_id)
 
+        # 无论是本次新建成功，还是并发下被别人先建好了，这里都返回默认 profile。
         return BankProfile(name=bank_id, disposition=DispositionTraits(**DEFAULT_DISPOSITION), mission="")
 
 

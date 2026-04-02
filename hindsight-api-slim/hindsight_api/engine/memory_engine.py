@@ -223,7 +223,7 @@ def _get_tiktoken_encoding():
     """Get cached tiktoken encoding (cl100k_base for GPT-4/3.5)."""
     global _TIKTOKEN_ENCODING
     if _TIKTOKEN_ENCODING is None:
-        _TIKTOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
+        _TIKTOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")#"cl100k_base" 是 OpenAI 常用编码（GPT-4 / GPT-3.5 用）
     return _TIKTOKEN_ENCODING
 
 
@@ -1623,13 +1623,17 @@ class MemoryEngine(MemoryEngineInterface):
                     self._pg0 = pg0
 
         async def init_embeddings():
-            """Initialize embedding model."""
-            # For local providers, run in thread pool to avoid blocking event loop
             if self.embeddings.provider_name == "local":
-                await loop.run_in_executor(None, lambda: asyncio.run(self.embeddings.initialize()))
+                # SentenceTransformers 加载是纯 CPU 操作（读文件 + PyTorch 初始化）
+                # 在 event loop 里直接执行会阻塞整个 asyncio 循环
+                # → 用 run_in_executor 放到线程池执行
+                await loop.run_in_executor(
+                    None,  # 使用默认 ThreadPoolExecutor
+                    lambda: asyncio.run(self.embeddings.initialize())  # 新 loop 在线程里跑
+                )
             else:
+                # TEI / OpenAI 等远程服务 → 正常 async HTTP 调用
                 await self.embeddings.initialize()
-
         async def init_cross_encoder():
             """Initialize cross-encoder model."""
             cross_encoder = self._cross_encoder_reranker.cross_encoder
@@ -1720,12 +1724,14 @@ class MemoryEngine(MemoryEngineInterface):
             # The tenant extension is the single source of truth for which schemas exist
             logger.info("Running database migrations...")
             config = get_config()
+            # 从 tenant_extension 获取所有租户 schema 列表
             tenants = await self._tenant_extension.list_tenants()
             if tenants:
                 logger.info(f"Running migrations on {len(tenants)} schema(s)...")
                 for tenant in tenants:
                     schema = tenant.schema
                     if schema:
+                        # 1. 运行 Alembic 标准迁移（建表、加索引等）
                         run_migrations(self.db_url, schema=schema, migration_database_url=config.migration_database_url)
                 logger.info("Schema migrations completed")
 
@@ -1734,6 +1740,9 @@ class MemoryEngine(MemoryEngineInterface):
                 for tenant in tenants:
                     schema = tenant.schema
                     if schema:
+                        # 2. 对齐向量列维度
+                        # 如果换了 embedding 模型（例如从 384 维换成 1536 维）
+                        # 自动 ALTER COLUMN embedding TYPE vector(1536)
                         ensure_embedding_dimension(
                             self.db_url,
                             self.embeddings.dimension,
@@ -1745,12 +1754,14 @@ class MemoryEngine(MemoryEngineInterface):
                 for tenant in tenants:
                     schema = tenant.schema
                     if schema:
+                        # 3. 切换向量索引（pgvector HNSW / vchord）
                         ensure_vector_extension(self.db_url, vector_extension=config.vector_extension, schema=schema)
 
                 # Ensure text search columns/indexes match the configured extension
                 for tenant in tenants:
                     schema = tenant.schema
                     if schema:
+                        # 4. 切换全文索引（native tsvector / vchord BM25 / pg_textsearch）
                         ensure_text_search_extension(
                             self.db_url, text_search_extension=config.text_search_extension, schema=schema
                         )
@@ -1761,12 +1772,17 @@ class MemoryEngine(MemoryEngineInterface):
         # For read-heavy workloads with many parallel think/search operations,
         # we need a larger pool. Read operations don't need strong isolation.
         async def _init_connection(conn: asyncpg.Connection) -> None:
+            """每条新连接建立时执行，设置连接级别参数"""
             # SET (not SET LOCAL) so it persists for the connection lifetime.
             # ef_search=200 improves HNSW recall quality for the per-fact_type
             # semantic queries in retrieve_semantic_bm25_combined().
             try:
+                # hnsw.ef_search = 200（默认 40）
+                # 提高 HNSW 近似最近邻搜索的召回率
+                # 代价：每次查询多扫描更多候选节点，延迟略增
                 await conn.execute("SET hnsw.ef_search = 200")
             except Exception:
+                # 非 pgvector 环境跳过（不报错）
                 logger.debug("Could not set hnsw.ef_search — extension may not support it")
 
         self._pool = await asyncpg.create_pool(
@@ -7574,14 +7590,17 @@ class MemoryEngine(MemoryEngineInterface):
         """
         import json
 
+        # 获取数据库连接池，后续要查询和写入 async_operations 表。
         pool = await self._get_pool()
 
-        # Check for existing pending task if deduplication is enabled
-        # Note: We only check 'pending', not 'processing', because a processing task
-        # uses a watermark from when it started - new memories added after that point
-        # would need another consolidation run to be processed.
+        # 如果启用了按 bank 去重，就先检查是否已经有同类 pending 任务。
+        # 这里只检查 pending，不检查 processing。
+        # 因为 processing 中的任务通常基于启动时的 watermark 处理数据，
+        # 后续新写入的数据仍然需要再跑一轮新的任务才能覆盖到。
         if dedupe_by_bank:
+            # 通过可重试连接执行查询，避免短暂数据库抖动导致提交失败。
             async with acquire_with_retry(pool) as conn:
+                # 查找同一个 bank 下、同一种 operation_type 的 pending 任务。
                 existing = await conn.fetchrow(
                     f"""
                     SELECT operation_id FROM {fq_table("async_operations")}
@@ -7591,30 +7610,37 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id,
                     operation_type,
                 )
+                # 如果已经存在 pending 任务，则直接复用，避免重复入队。
                 if existing:
                     logger.debug(
                         f"{operation_type} task already pending for bank_id={bank_id}, "
                         f"skipping duplicate (existing operation_id={existing['operation_id']})"
                     )
+                    # 返回已存在任务的 operation_id，并标记这是一次去重命中。
                     return {
                         "operation_id": str(existing["operation_id"]),
                         "deduplicated": True,
                     }
 
+        # 为即将创建的新异步任务生成唯一 operation_id。
         operation_id = uuid.uuid4()
 
-        # Build full payload before INSERT so task_payload is included atomically.
-        # Previously the INSERT omitted task_payload and a separate submit_task call
-        # did an UPDATE — a crash between the two left a null-payload row that the
-        # worker's claim query (task_payload IS NOT NULL) could never pick up.
+        # 在 INSERT 之前先构造完整 payload，确保 task_payload 能原子性落库。
+        # 之前如果先插入空记录、再单独 UPDATE payload，中间一旦进程崩溃，
+        # 就会留下 task_payload 为空的脏记录，而 worker 的 claim 查询
+        # 又依赖 task_payload IS NOT NULL，导致该任务永远不会被消费。
         full_payload = {
+            # type 告诉后台执行器具体要跑哪类任务。
             "type": task_type,
+            # operation_id 放进 payload，方便 worker 和日志系统关联同一任务。
             "operation_id": str(operation_id),
+            # bank_id 也放进 payload，保证 worker 无需额外查询即可拿到上下文。
             "bank_id": bank_id,
+            # 展开调用方传入的自定义任务参数。
             **task_payload,
         }
 
-        # Insert operation record with task_payload in a single atomic statement
+        # 用单条 INSERT 同时写入 operation 记录和完整 task_payload。
         async with acquire_with_retry(pool) as conn:
             await conn.execute(
                 f"""
@@ -7629,17 +7655,50 @@ class MemoryEngine(MemoryEngineInterface):
                 json.dumps(full_payload, default=_json_default),
             )
 
-        # For SyncTaskBackend: executes the task immediately.
-        # For BrokerTaskBackend: does an idempotent UPDATE (payload already set above),
-        # kept for symmetry and to support any future notification mechanisms.
+        # 把任务提交给当前配置的任务后端。
+        # 对 SyncTaskBackend，这里会立即执行任务。
+        # 对 BrokerTaskBackend，这里通常只是做一次幂等提交/通知；
+        # 由于 payload 已在上面的 INSERT 中落库，即使这里重复触发也没问题。
         await self._task_backend.submit_task(full_payload)
 
+        # 记录任务已成功排队，方便线上排查异步任务链路。
         logger.info(f"{operation_type} task queued for bank_id={bank_id}, operation_id={operation_id}")
 
+        # 返回新建任务的 operation_id，供上层接口或调用方追踪状态。
         return {
             "operation_id": str(operation_id),
         }
 
+# submit_async_retain 里的主任务和子任务，都是存在同一张 async_operations 表里，它们不是靠单独的外键列关联，而是靠 result_metadata 里的 JSON 字段关联。
+#
+# 具体是这样：
+#
+# 主任务先插入一条 async_operations 记录，operation_type 是 "batch_retain"，它的 result_metadata 用的是 BatchRetainParentMetadata，里面有 is_parent: true。
+# 代码在 memory_engine.py (line 7779) 和 operation_metadata.py (line 11)
+#
+# 每个子任务也各自插入一条 async_operations 记录，但它们的 result_metadata 用的是 BatchRetainChildMetadata，里面会写：
+#
+# parent_operation_id
+# sub_batch_index
+# total_sub_batches
+# items_count
+# 代码在 memory_engine.py (line 7827) 和 operation_metadata.py (line 23)
+# 所以“关联关系”本质上是：
+#
+# 父任务：result_metadata.is_parent = true
+# 子任务：result_metadata.parent_operation_id = <父任务 operation_id>
+# 查询和聚合时也是按这个字段找的：
+#
+# 查父任务状态时，代码会先看 result_metadata.is_parent 判断它是不是父任务
+# 见 memory_engine.py (line 7324)
+#
+# 如果是父任务，就用
+# result_metadata::jsonb @> {"parent_operation_id": operation_id}
+# 去把所有子任务查出来，再按 sub_batch_index 排序
+# 见 memory_engine.py (line 7335)
+#
+# 子任务完成或失败后，也会反查同一个 parent_operation_id 的所有 sibling，再决定是否把父任务更新成 completed 或 failed
+# 见 memory_engine.py (line 1515)
     async def submit_async_retain(
         self,
         bank_id: str,
@@ -7654,84 +7713,106 @@ class MemoryEngine(MemoryEngineInterface):
         For large batches (exceeding retain_batch_chars threshold), automatically splits
         into smaller sub-batches and creates a parent operation that tracks all children.
         """
+        # 先做租户鉴权，并在当前请求上下文中建立正确的租户/Schema 作用域。
         await self._authenticate_tenant(request_context)
 
-        # Run operation validator (bank access, credits, etc.) before queuing
+        # 在真正入队前先跑操作级校验，比如 bank 访问权限、额度限制等。
         if self._operation_validator:
             from hindsight_api.extensions import RetainContext
 
+            # 构造 retain 校验上下文；这里复制 contents，避免校验器意外修改原列表对象。
             ctx = RetainContext(
                 bank_id=bank_id,
                 contents=[dict(c) for c in contents],
                 request_context=request_context,
             )
+            # 执行 retain 校验，并拿到可能被扩展层调整过的结果。
             result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
+            # 如果扩展层返回了新的 contents，就用它覆盖后续真实入队的数据。
             if result and result.contents is not None:
                 contents = result.contents
 
-        # Validate no duplicate document_ids in the batch
-        # Having duplicate document_ids causes race conditions in document upserts during parallel processing
+        # 校验同一批次里不存在重复 document_id。
+        # 否则并行处理时会在 document upsert 阶段产生竞争条件。
         doc_ids = [item.get("document_id") for item in contents if item.get("document_id")]
+        # 如果去重前后数量不一致，说明存在重复 document_id。
         if len(doc_ids) != len(set(doc_ids)):
             from collections import Counter
 
+            # 找出所有重复出现的 document_id，方便报错时直接指出问题数据。
             duplicates = [doc_id for doc_id, count in Counter(doc_ids).items() if count > 1]
+            # 直接拒绝该批次，防止后续异步任务在数据库层互相覆盖。
             raise ValueError(
                 f"Batch contains duplicate document_ids: {duplicates}. "
                 f"Each content item in a batch must have a unique document_id to avoid race conditions."
             )
 
-        # Calculate total token count and determine if we need to split
+        # 统计整批内容的 token 总量，用来决定是否要拆分成多个子批次。
         total_tokens = sum(count_tokens(item.get("content", "")) for item in contents)
+        # 读取运行时配置。
         config = get_config()
+        # 每个子批次允许的最大 token 数。
         tokens_per_batch = config.retain_batch_tokens
 
-        # Split into sub-batches based on token count
+        # 按 token 上限把请求拆成多个子批次，避免单个后台任务过大。
         sub_batches = []
+        # current_batch 保存当前正在累积的子批次。
         current_batch = []
+        # 跟踪当前子批次已累计的 token 数。
         current_batch_tokens = 0
 
+        # 顺序遍历所有内容项，按 token 数做贪心分批。
         for item in contents:
+            # 计算当前条目的 token 数。
             item_tokens = count_tokens(item.get("content", ""))
 
-            # If adding this item would exceed the limit, start a new batch
-            # (unless current batch is empty - then we must include it even if it's large)
+            # 如果当前子批次已非空，且再加入这一项会超出上限，就先封存当前批次并开新批次。
+            # 如果当前批次为空，则即便这一项本身超大，也必须单独接收进去。
             if current_batch and current_batch_tokens + item_tokens > tokens_per_batch:
+                # 先把已经累积好的当前批次加入总子批次列表。
                 sub_batches.append(current_batch)
+                # 用当前 item 作为新子批次的第一项重新开始。
                 current_batch = [item]
+                # 新批次的 token 初始值就是当前 item 的 token 数。
                 current_batch_tokens = item_tokens
             else:
+                # 未超限时，把当前 item 继续追加到当前子批次。
                 current_batch.append(item)
+                # 同步累加当前子批次的 token 数。
                 current_batch_tokens += item_tokens
 
-        # Add the last batch
+        # 循环结束后，如果还有未落盘的最后一个子批次，也要补进列表。
         if current_batch:
             sub_batches.append(current_batch)
 
-        # Log splitting info if we actually split
+        # 只有真的拆成多个子批次时，才记录一次拆分日志。
         if len(sub_batches) > 1:
             logger.info(
                 f"Large async retain batch ({total_tokens:,} tokens from {len(contents)} items). "
                 f"Split into {len(sub_batches)} sub-batches: {[len(b) for b in sub_batches]} items each"
             )
 
-        # Always create parent operation (even for single batch - simpler, more reliable code path)
+        # 无论是否拆分，都统一创建一个父 operation。
+        # 这样单批和多批走同一套状态聚合路径，代码更简单也更稳定。
         import uuid
 
+        # 为父 operation 生成唯一 ID，用来汇总追踪所有子任务。
         parent_operation_id = uuid.uuid4()
+        # 获取数据库连接池，后面要往 async_operations 表里插入父记录。
         pool = await self._get_pool()
 
-        # Ensure the bank row exists before inserting async_operations (which now has a FK).
-        # Banks are created lazily on first retain, but the FK requires the row to exist first.
+        # 先确保 bank 行存在，再插入 async_operations。
+        # 因为 banks 是首次 retain 时懒创建的，而 async_operations 现在有外键约束。
         await bank_utils.get_bank_profile(pool, bank_id)
 
-        # Create typed metadata for parent operation
+        # 构造父 operation 的结构化元数据，供状态聚合和调试使用。
         parent_metadata = BatchRetainParentMetadata(
             items_count=len(contents),
             total_tokens=total_tokens,
             num_sub_batches=len(sub_batches),
         )
 
+        # 先把父 operation 插入数据库，后续所有子任务都挂在它下面。
         async with acquire_with_retry(pool) as conn:
             await conn.execute(
                 f"""
@@ -7745,28 +7826,34 @@ class MemoryEngine(MemoryEngineInterface):
                 "pending",  # Will be updated by status aggregation
             )
 
+        # 记录父 operation 已创建成功，方便排查任务编排过程。
         logger.info(f"Created parent operation {parent_operation_id} for {len(sub_batches)} sub-batch(es)")
 
-        # Submit child operations for each sub-batch
+        # 为每个子批次分别创建一个子 operation，交给后台 worker 执行。
         for i, sub_batch in enumerate(sub_batches, 1):
+            # 只有存在多个子批次时，才额外打印当前子批次的拆分信息。
             if len(sub_batches) > 1:
+                # 统计当前子批次 token 数，用于日志展示。
                 sub_batch_tokens = sum(count_tokens(item.get("content", "")) for item in sub_batch)
                 logger.info(
                     f"Submitting sub-batch {i}/{len(sub_batches)}: {len(sub_batch)} items, {sub_batch_tokens:,} tokens"
                 )
 
+            # 构造该子任务的 payload，核心字段是当前子批次的 contents。
             task_payload: dict[str, Any] = {"contents": sub_batch}
+            # 如果有文档级 tags，就一起透传给子任务。
             if document_tags:
                 task_payload["document_tags"] = document_tags
+            # 如果调用方指定了 retain strategy，也要带给子任务执行。
             if strategy:
                 task_payload["strategy"] = strategy
-            # Pass tenant_id and api_key_id through task payload
+            # 把 tenant_id 和 api_key_id 一起带进任务 payload，确保 worker 侧能还原上下文。
             if request_context.tenant_id:
                 task_payload["_tenant_id"] = request_context.tenant_id
             if request_context.api_key_id:
                 task_payload["_api_key_id"] = request_context.api_key_id
 
-            # Create typed metadata for child operation
+            # 构造子 operation 的结构化元数据，用于父子任务关联和状态展示。
             child_metadata = BatchRetainChildMetadata(
                 items_count=len(sub_batch),
                 parent_operation_id=str(parent_operation_id),
@@ -7774,7 +7861,7 @@ class MemoryEngine(MemoryEngineInterface):
                 total_sub_batches=len(sub_batches),
             )
 
-            # Create child operation with reference to parent
+            # 创建真正的后台子任务，并通过 metadata 挂到父 operation 下。
             await self._submit_async_operation(
                 bank_id=bank_id,
                 operation_type="retain",
@@ -7784,8 +7871,10 @@ class MemoryEngine(MemoryEngineInterface):
                 dedupe_by_bank=False,
             )
 
+        # 返回父 operation_id 给调用方，后续通过它查询整批任务状态。
         return {
             "operation_id": str(parent_operation_id),
+            # items_count 返回原始请求的内容条数，便于上层响应直接复用。
             "items_count": len(contents),
         }
 
