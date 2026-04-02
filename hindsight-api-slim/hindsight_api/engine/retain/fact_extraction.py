@@ -149,7 +149,11 @@ class ExtractedFact(BaseModel):
         json_schema_mode="validation",
         json_schema_extra={"required": ["what", "when", "where", "who", "why", "fact_type"]},
     )
-
+    #  what: str   # 核心事实（1-2句话）
+    #     when: str   # 时间（ISO 日期 or "N/A"）
+    #     where: str  # 地点
+    #     who: str    # 涉及人员（解析共指：如"我室友 Emily"→"Emily，用户的室友"）
+    #     why: str    # 背景/动机/情感
     what: str = Field(description="Core fact - concise but complete (1-2 sentences)")
     when: str = Field(description="When it happened. 'N/A' if unknown.")
     where: str = Field(description="Location if relevant. 'N/A' if none.")
@@ -157,12 +161,15 @@ class ExtractedFact(BaseModel):
     why: str = Field(description="Context/significance if important. 'N/A' if obvious.")
 
     fact_kind: str = Field(default="conversation", description="'event' or 'conversation'")
+    # ISO 时间戳
     occurred_start: str | None = Field(default=None, description="ISO timestamp for events")
     occurred_end: str | None = Field(default=None, description="ISO timestamp for event end")
+    #  world=客观, assistant=第一人称
     fact_type: Literal["world", "assistant"] = Field(
         description="'world' = objective/external facts. 'assistant' = first-person actions, experiences, or observations by the speaker."
     )
     entities: list[Entity] | None = Field(default=None, description="People, places, concepts")
+    # 与之前 fact 的因果关系
     causal_relations: list[FactCausalRelation] | None = Field(
         default=None, description="Links to previous facts (target_index < this fact's index)"
     )

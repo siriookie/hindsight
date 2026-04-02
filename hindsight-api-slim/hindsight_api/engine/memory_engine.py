@@ -633,6 +633,10 @@ class MemoryEngine(MemoryEngineInterface):
         Raises:
             ValueError: If bank_id is missing
             Exception: Any exception from retain_batch_async (propagates to execute_task for retry)
+
+        实现原理：这个 handler 基本不自己实现 retain 业务，而是把任务 payload
+        还原成一次内部 retain 请求，再复用现有 retain pipeline。
+        这样后台任务入口和 HTTP 入口走的是同一套主逻辑，避免双轨实现漂移。
         """
         bank_id = task_dict.get("bank_id")
         if not bank_id:
@@ -646,10 +650,9 @@ class MemoryEngine(MemoryEngineInterface):
             f"[BATCH_RETAIN_TASK] Starting background batch retain for bank_id={bank_id}, {len(contents)} items, operation_id={operation_id}"
         )
 
-        # Restore tenant_id/api_key_id from task payload so extensions
-        # (e.g., operation validators) can attribute the operation correctly.
-        # internal=True to skip extension auth (worker has no API key),
-        # user_initiated=True so extensions know this originated from a user request.
+        # worker 里没有原始 HTTP 请求，但计费、配额、审计等扩展仍然需要知道
+        # 这次后台 retain 最初是谁触发的，所以这里把归因信息从任务 payload 里
+        # 恢复成内部 RequestContext。
         from hindsight_api.models import RequestContext
 
         context = RequestContext(
@@ -673,7 +676,8 @@ class MemoryEngine(MemoryEngineInterface):
             ),
         )
 
-        # If this retain was triggered by file conversion, update document with file metadata
+        # 文件导入场景下，正文由 retain pipeline 创建，文件元数据要在 retain 成功后
+        # 再补回 documents 表，因此这里做一次后置更新。
         file_metadata = task_dict.get("_file_metadata")
         if file_metadata and len(contents) == 1:
             doc_id = contents[0].get("document_id")
@@ -712,6 +716,13 @@ class MemoryEngine(MemoryEngineInterface):
         Raises:
             ValueError: If required fields are missing
             Exception: Any exception from conversion (includes filename in error)
+
+        实现原理：文件导入被拆成两个阶段：
+        1. 当前任务只负责“取文件并转换成 markdown”
+        2. 真正的 retain 另起一个异步任务去跑
+
+        这样可以尽快结束当前 conversion operation，让“转换”和“retain”拥有
+        各自独立的状态与恢复语义，也避免把完整 retain 流程塞进同一个 worker slot。
         """
         bank_id = task_dict.get("bank_id")
         storage_key = task_dict.get("storage_key")
@@ -725,11 +736,11 @@ class MemoryEngine(MemoryEngineInterface):
         logger.info(f"[FILE_CONVERT_RETAIN] Starting for bank_id={bank_id}, document_id={document_id}, file={filename}")
 
         try:
-            # Retrieve file from storage
+            # 先取原始文件字节，再进入解析链。
             file_data = await self._file_storage.retrieve(storage_key)
 
-            # Convert to markdown using the ordered fallback chain stored in the task payload.
-            # task_dict["parser"] is always a list[str] set at submission time.
+            # parser 链在任务提交时就已固定，worker 只负责按既定顺序尝试，
+            # 避免执行期间配置变化导致同一任务前后行为不一致。
             parser_chain: list[str] = task_dict.get("parser") or []
             if not parser_chain:
                 raise ValueError("No parser chain defined for file_convert_retain task")
@@ -777,7 +788,7 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as e:
                 logger.warning(f"[FILE_CONVERT_RETAIN] on_file_convert_complete hook failed: {e}")
 
-        # Build retain task payload
+        # 当前任务的输出不是直接入库，而是构造下游 retain 任务的输入 payload。
         retain_contents = [
             {
                 "content": markdown_content,
@@ -809,7 +820,8 @@ class MemoryEngine(MemoryEngineInterface):
             "file_content_type": task_dict["content_type"],
         }
 
-        # In one transaction: create the retain async operation AND mark this conversion as completed
+        # 把“创建 retain 子 operation”和“标记当前 conversion 完成”放在同一事务，
+        # 避免出现 conversion 已完成但 retain 子任务没建出来的中间态。
         retain_operation_id = uuid.uuid4()
         pool = await self._get_pool()
         async with acquire_with_retry(pool) as conn:
@@ -839,7 +851,8 @@ class MemoryEngine(MemoryEngineInterface):
                         uuid.UUID(operation_id),
                     )
 
-        # Submit the retain task to the task backend (outside the transaction)
+        # 真正提交子任务放在事务外，避免把外部副作用混进数据库事务；但 operation
+        # 行已经先落库了，因此即使之后进程崩溃，恢复路径仍然清晰。
         full_retain_payload = {
             "type": "batch_retain",
             "operation_id": str(retain_operation_id),
@@ -877,12 +890,17 @@ class MemoryEngine(MemoryEngineInterface):
         Raises:
             ValueError: If bank_id is missing
             Exception: Any exception from consolidation (propagates to execute_task for retry)
+
+        实现原理：这个 handler 本身保持很薄，主要负责恢复请求归因上下文，然后
+        调用 consolidation 子模块。这样复杂的聚合逻辑被隔离在专门模块里，
+        而任务执行层只负责调度与状态语义。
         """
         bank_id = task_dict.get("bank_id")
         if not bank_id:
             raise ValueError("bank_id is required for consolidation task")
 
-        # Skip consolidation when LLM provider is "none"
+        # provider=none 表示当前部署不具备生成式能力；这里直接短路，避免无意义
+        # 的后台重试和 LLM 相关错误。
         if self._llm_config.provider == "none":
             logger.info(f"[CONSOLIDATION] Skipping consolidation for bank {bank_id}: LLM provider is 'none'")
             return {"memories_processed": 0, "skipped": True}
@@ -891,8 +909,8 @@ class MemoryEngine(MemoryEngineInterface):
 
         from .consolidation import run_consolidation_job
 
-        # Restore tenant_id/api_key_id from task payload so downstream operations
-        # (e.g., mental model refreshes) can attribute usage to the correct org.
+        # consolidation 过程中可能再触发下游任务，例如 refresh_mental_model，
+        # 所以这里要把 tenant/api_key 的归因信息完整恢复并向下透传。
         internal_context = RequestContext(
             internal=True,
             tenant_id=task_dict.get("_tenant_id"),
@@ -920,6 +938,10 @@ class MemoryEngine(MemoryEngineInterface):
         Raises:
             ValueError: If required fields are missing
             Exception: Any exception from reflect/update (propagates to execute_task for retry)
+
+        实现原理：刷新 mental model 不是直接改一段文本，而是重新取出该模型
+        的 `source_query` 和 trigger 配置，再完整跑一次 reflect，然后覆盖更新。
+        这样刷新和首次生成使用同一套推理规则，不会出现两套生成语义。
         """
         bank_id = task_dict.get("bank_id")
         mental_model_id = task_dict.get("mental_model_id")
@@ -939,7 +961,8 @@ class MemoryEngine(MemoryEngineInterface):
             api_key_id=task_dict.get("_api_key_id"),
         )
 
-        # Get the current mental model to get source_query
+        # 真正的刷新输入不只在 task payload 里，还保存在 mental model 自身记录中，
+        # 所以先回表取出 source_query 和 trigger 配置。
         mental_model = await self.get_mental_model(bank_id, mental_model_id, request_context=internal_context)
         if not mental_model:
             raise ValueError(f"Mental model {mental_model_id} not found in bank {bank_id}")
@@ -954,8 +977,8 @@ class MemoryEngine(MemoryEngineInterface):
 
         tag_filtering = _resolve_refresh_tag_filtering(mental_model.get("tags"), trigger_data)
 
-        # Run reflect to generate new content, excluding the mental model being refreshed
-        # Always add self to excluded IDs to prevent circular reference
+        # 刷新时必须显式排除当前 mental model 自己，避免 reflect 把旧版本自己
+        # 当作上下文输入，形成自我引用和内容回音。
         reflect_result = await self.reflect_async(
             bank_id=bank_id,
             query=source_query,
@@ -1058,16 +1081,23 @@ class MemoryEngine(MemoryEngineInterface):
         Args:
             task_dict: Task dictionary with 'type' key and other payload data
                       Example: {'type': 'batch_retain', 'bank_id': '...', 'contents': [...]}
+
+        实现原理：这是 worker 执行阶段的统一入口，负责恢复上下文、路由到
+        具体 handler，并统一处理 operation 状态、审计、重试和失败语义。
+        这样每个 handler 只关注业务逻辑，不需要自己维护完整任务状态机。
         """
         task_type = task_dict.get("type")
         operation_id = task_dict.get("operation_id")
 
-        # Set schema context for multi-tenant task execution
+        # `_schema` 由 poller 注入，属于执行上下文而不是业务 payload。
+        # 这里先恢复租户 schema，保证后续数据库访问都落到正确的 tenant。
         schema = task_dict.pop("_schema", None)
         if schema:
             _current_schema.set(schema)
 
-        # Check if operation was cancelled (only for tasks with operation_id)
+        # 对于有 operation_id 的任务，先检查 operation 行是否仍然存在。
+        # 如果用户取消任务、删除 bank，或 CASCADE 删除了 operation，任务应
+        # 立即短路，而不是继续执行昂贵后台逻辑。
         if operation_id:
             try:
                 pool = await self._get_pool()
@@ -1077,12 +1107,12 @@ class MemoryEngine(MemoryEngineInterface):
                         uuid.UUID(operation_id),
                     )
                     if not result:
-                        # Operation was cancelled, skip processing
+                        # 记录已经不存在，说明这条任务在语义上已经失效。
                         logger.info(f"Skipping cancelled operation: {operation_id}")
                         return
             except Exception as e:
                 logger.error(f"Failed to check operation status {operation_id}: {e}")
-                # Continue with processing if we can't check status
+                # 取消检查失败时不直接放弃任务，避免数据库瞬时抖动导致有效任务被误杀。
 
         consolidation_result: dict | None = None
         bank_id = task_dict.get("bank_id")
@@ -1090,6 +1120,7 @@ class MemoryEngine(MemoryEngineInterface):
             self._audit_logger, task_type or "unknown", "system", bank_id, request=task_dict
         ) as audit_entry:
             try:
+                # 分发层只做轻量路由，不在这里混入具体业务实现。
                 if task_type == "batch_retain":
                     await self._handle_batch_retain(task_dict)
                 elif task_type == "file_convert_retain":
@@ -1102,16 +1133,18 @@ class MemoryEngine(MemoryEngineInterface):
                     await self._handle_webhook_delivery(task_dict)
                 else:
                     logger.error(f"Unknown task type: {task_type}")
-                    # Don't retry unknown task types
+                    # 未知类型属于永久性错误，重试没有意义，直接清理 operation。
                     if operation_id:
                         await self._delete_operation_record(operation_id)
                     return
 
-                # Task succeeded - mark operation as completed
-                # file_convert_retain marks itself as completed in a transaction, skip double-marking
+                # 成功后的状态回写统一放在这里。
+                # `file_convert_retain` 例外：它内部要在同一事务里“创建 retain 子任务
+                # + 标记自己完成”，所以不能在这里重复 mark completed。
                 if operation_id and task_type not in ("file_convert_retain",):
                     if task_type == "consolidation":
-                        # Atomically mark completed AND queue webhook delivery in one transaction
+                        # consolidation 需要把“完成状态”和“webhook outbox 入队”
+                        # 绑定在同一事务里，避免出现完成了但 webhook 丢失的窗口。
                         await self._mark_operation_completed_and_fire_webhook(
                             operation_id=operation_id,
                             bank_id=task_dict.get("bank_id", ""),
@@ -1125,7 +1158,7 @@ class MemoryEngine(MemoryEngineInterface):
                 audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
             except RetryTaskAt:
-                # Task-owned retry: let the poller handle scheduling
+                # 重试调度属于 poller 的职责，这里只透传“应该重试”的语义。
                 raise
             except Exception as e:
                 logger.error(f"Task execution failed: {task_type}, error: {e}")
@@ -1135,8 +1168,8 @@ class MemoryEngine(MemoryEngineInterface):
                 traceback.print_exc()
 
                 if task_type == "file_convert_retain":
-                    # Non-retryable: mark as failed immediately.
-                    # Conversion failures won't improve on retry (missing OCR, corrupted file, etc.)
+                    # 文件转换失败通常是输入文件或解析能力问题，重试收益很低，
+                    # 这里直接记 failed，而不是进入延迟重试。
                     logger.error(f"Not retrying task {task_type} (non-retryable), marking as failed")
                     if operation_id:
                         await self._mark_operation_failed(operation_id, str(e), error_traceback)
@@ -1152,7 +1185,8 @@ class MemoryEngine(MemoryEngineInterface):
                             error_message=str(e),
                             schema=schema,
                         )
-                    # Retryable: use RetryTaskAt if under the retry limit, else re-raise (poller marks failed)
+                    # 普通任务默认允许有限次重试；超过上限后把异常继续抛给 poller，
+                    # 由 poller 把 operation 最终标为 failed。
                     retry_count = task_dict.get("_retry_count", 0)
                     if retry_count < 3:
                         raise RetryTaskAt(retry_at=datetime.now(UTC) + timedelta(seconds=60), message=str(e))
@@ -1272,6 +1306,10 @@ class MemoryEngine(MemoryEngineInterface):
         Raises RetryTaskAt to schedule a retry on failure (up to MAX_ATTEMPTS).
         Raises the original exception when retries are exhausted (poller marks failed).
         Response status code and body are stored in result_metadata for debugging.
+
+        实现原理：webhook 投递被建模成普通后台任务，而不是在主业务事务里直接发
+        HTTP。这样可以把不稳定的外部网络调用从核心写库路径里隔离出来，并复用
+        worker 的重试、失败标记和可观测性能力。
         """
         from ..webhooks.manager import MAX_ATTEMPTS, RETRY_DELAYS
         from ..webhooks.models import WebhookHttpConfig
@@ -1284,6 +1322,8 @@ class MemoryEngine(MemoryEngineInterface):
         operation_id: str | None = task_dict.get("_operation_id")
         http_config = WebhookHttpConfig.model_validate(task_dict.get("http_config") or {})
 
+        # payload 可能是结构化 JSON，也可能已经是字符串；这里统一转成字节流，
+        # 后续签名和 HTTP 发送都基于同一份原始内容。
         if isinstance(raw_payload, dict):
             payload_bytes = json.dumps(raw_payload).encode()
         else:
@@ -1294,6 +1334,8 @@ class MemoryEngine(MemoryEngineInterface):
             "X-Hindsight-Event": event_type,
             **http_config.headers,
         }
+        # 签名必须基于最终发送的 payload_bytes 计算，确保接收方验签内容与实际
+        # 请求体完全一致。
         if secret and self._webhook_manager:
             headers["X-Hindsight-Signature"] = self._webhook_manager._sign_payload(secret, payload_bytes)
 
@@ -1319,6 +1361,8 @@ class MemoryEngine(MemoryEngineInterface):
             response_body = response.text if response is not None else None
             if operation_id:
                 await self._update_webhook_delivery_metadata(operation_id, status_code, response_body)
+            # 超过最大尝试次数后不再请求 poller 重试，而是把原异常抛出去，
+            # 让 poller 将这条任务最终标记为 failed。
             if retry_count >= MAX_ATTEMPTS - 1:
                 logger.error(
                     f"webhook_delivery permanently_failed url={url} attempts={retry_count + 1} "
@@ -1367,6 +1411,9 @@ class MemoryEngine(MemoryEngineInterface):
 
         Also checks if this is a child operation and updates the parent if all siblings are done.
         Uses a single transaction to avoid race conditions when multiple children fail simultaneously.
+
+        实现原理：当前子任务的失败状态和父任务聚合状态判断必须放在同一事务里。
+        否则多个子任务并发完成时，父任务可能基于不一致的兄弟状态做出错误决策。
         """
         try:
             pool = await self._get_pool()
@@ -1376,7 +1423,8 @@ class MemoryEngine(MemoryEngineInterface):
 
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
-                    # Mark this operation as failed
+                    # 先落当前 operation 的失败状态，再在同一事务里决定父任务
+                    # 是否也要聚合成 failed/completed。
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
@@ -1392,8 +1440,7 @@ class MemoryEngine(MemoryEngineInterface):
                         return
                     logger.info(f"Marked async operation as failed: {operation_id}")
 
-                    # Check if this is a child operation and update parent if all siblings are done
-                    # This happens in the same transaction after the child status is updated
+                    # 父任务聚合逻辑依赖当前子任务的新状态已在本事务内可见。
                     await self._maybe_update_parent_operation(operation_id, conn)
         except Exception as e:
             logger.error(f"Failed to mark operation as failed {operation_id}: {e}")
@@ -1403,12 +1450,16 @@ class MemoryEngine(MemoryEngineInterface):
 
         Also checks if this is a child operation and updates the parent if all siblings are done.
         Uses a single transaction to avoid race conditions when multiple children complete simultaneously.
+
+        实现原理：completed 路径和 failed 路径保持同样的事务边界，保证父子
+        operation 的状态推进语义一致，不会一条路径是原子的、另一条不是。
         """
         try:
             pool = await self._get_pool()
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
-                    # Mark this operation as completed
+                    # 当前 operation 的完成状态和父任务聚合状态一起提交，避免
+                    # 兄弟任务并发完成时出现竞态。
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
@@ -1425,8 +1476,7 @@ class MemoryEngine(MemoryEngineInterface):
                         return
                     logger.info(f"Marked async operation as completed: {operation_id}")
 
-                    # Check if this is a child operation and update parent if all siblings are done
-                    # This happens in the same transaction after the child status is updated
+                    # 父任务是否完成，取决于所有子任务在这一时刻的事务内可见状态。
                     await self._maybe_update_parent_operation(operation_id, conn)
         except Exception as e:
             logger.error(f"Failed to mark operation as completed {operation_id}: {e}")
@@ -1445,6 +1495,10 @@ class MemoryEngine(MemoryEngineInterface):
         Uses the transactional outbox pattern: the webhook delivery row is inserted in the
         same database transaction as the status update. This guarantees at-least-once delivery
         even if the process crashes immediately after committing.
+
+        实现原理：对于 consolidation，状态完成和 webhook 排队不能分成两个独立
+        步骤，否则会出现“operation 已 completed，但 webhook 没排进去”的丢事件
+        窗口。这里采用 transactional outbox，把两者绑定在同一事务里。
         """
         from ..webhooks.models import ConsolidationEventData, WebhookEvent, WebhookEventType
 
@@ -1469,7 +1523,8 @@ class MemoryEngine(MemoryEngineInterface):
                     logger.info(f"Marked async operation as completed: {operation_id}")
                     await self._maybe_update_parent_operation(operation_id, conn)
 
-                    # Queue webhook deliveries inside the same transaction
+                    # 这里只写 outbox，不直接发 HTTP；真正的网络投递由后续
+                    # webhook_delivery 任务完成。
                     if self._webhook_manager:
                         data = ConsolidationEventData(
                             observations_created=result.get("observations_created") if result else None,
@@ -1498,9 +1553,18 @@ class MemoryEngine(MemoryEngineInterface):
         Args:
             child_operation_id: The operation ID that just completed or failed
             conn: Database connection with an active transaction
+
+        实现原理：batch retain 这类父子 operation 不是靠外键列聚合，而是靠
+        `result_metadata.parent_operation_id` 关联。这里在子任务状态变化后，
+        重新扫描同一父任务下所有兄弟任务：
+        - 只要还有 pending/processing，父任务保持不动
+        - 只要有任一 failed，父任务标 failed
+        - 全部 completed，父任务才标 completed
+
+        父任务行会先 `FOR UPDATE` 加锁，避免多个子任务同时完成时并发更新父任务。
         """
         try:
-            # Get this operation's metadata to check if it has a parent
+            # 先从当前子任务记录里取 parent_operation_id，只有子任务才需要继续聚合。
             row = await conn.fetchrow(
                 f"""
                 SELECT result_metadata, bank_id
@@ -1522,8 +1586,7 @@ class MemoryEngine(MemoryEngineInterface):
 
             bank_id = row["bank_id"]
 
-            # Lock the parent operation to prevent concurrent updates from other children
-            # Use FOR UPDATE to ensure only one child can update the parent at a time
+            # 锁住父任务，确保同一时刻只有一个子任务在推进父任务状态。
             parent_row = await conn.fetchrow(
                 f"""
                 SELECT operation_id
@@ -1539,8 +1602,7 @@ class MemoryEngine(MemoryEngineInterface):
                 # Parent doesn't exist (shouldn't happen)
                 return
 
-            # Get all sibling operations (including this one)
-            # This query runs in the same transaction, so it sees the current child's updated status
+            # 同一事务内扫描所有兄弟任务，可以看到当前子任务刚刚更新后的最新状态。
             siblings = await conn.fetch(
                 f"""
                 SELECT status
@@ -1555,7 +1617,7 @@ class MemoryEngine(MemoryEngineInterface):
             if not siblings:
                 return
 
-            # Check if all siblings are done (completed or failed)
+            # 父任务是否推进，取决于全部兄弟任务的当前聚合结果。
             all_completed = all(sib["status"] == "completed" for sib in siblings)
             any_failed = any(sib["status"] == "failed" for sib in siblings)
             all_done = all(sib["status"] in ("completed", "failed") for sib in siblings)
@@ -1564,10 +1626,10 @@ class MemoryEngine(MemoryEngineInterface):
                 # Some siblings still pending/processing
                 return
 
-            # All siblings are done - update parent status
+            # 全部子任务结束后，再决定父任务最终态。
             if any_failed:
                 new_status = "failed"
-                # Set parent error message to indicate child failure
+                # 只要任一子任务失败，父任务就聚合为 failed。
                 await conn.execute(
                     f"""
                     UPDATE {fq_table("async_operations")}
@@ -2101,6 +2163,18 @@ class MemoryEngine(MemoryEngineInterface):
             If return_usage=False: List of lists of unit IDs (one list per content item)
             If return_usage=True: Tuple of (unit_ids, TokenUsage)
 
+        实现原理：`retain_batch_async()` 是 retain 的批量入口协调器，不直接承载
+        具体抽取/写库细节，而是负责把一批内容整理成适合后端流水线处理的形态。
+        它主要做四件事：
+        1. 认证租户并建立 schema 上下文
+        2. 运行前置校验和兼容性参数整理
+        3. 按 token 大小把超大批次切成多个子批次
+        4. 汇总结果、usage，并在成功后触发 consolidation
+
+        这样做的原因是 retain 真正的计算和数据库写入都很重，如果把“参数整理 /
+        批次切分 / 后置触发”混进底层 orchestrator，会让核心 retain 流程既难复用
+        也难维护。
+
         Example (new style - per-content document_id):
             unit_ids = await memory.retain_batch_async(
                 bank_id="user123",
@@ -2130,10 +2204,12 @@ class MemoryEngine(MemoryEngineInterface):
                 return [], TokenUsage()
             return []
 
-        # Authenticate tenant and set schema in context (for fq_table())
+        # 先认证租户并把 schema 写入 contextvar；后续 retain 流程里的 SQL 都依赖
+        # 这个上下文决定表名落在哪个 tenant schema。
         await self._authenticate_tenant(request_context)
 
-        # Validate operation if validator is configured
+        # retain 校验扩展可能会拒绝请求，也可能重写 contents；因此要在真正进入
+        # retain 流程前先跑一遍，确保后续所有批次都基于校验后的输入执行。
         contents_copy = [dict(c) for c in contents]  # Convert TypedDict to regular dict for extension
         if self._operation_validator:
             from hindsight_api.extensions import RetainContext
@@ -2150,14 +2226,15 @@ class MemoryEngine(MemoryEngineInterface):
             if result and result.contents is not None:
                 contents = result.contents
 
-        # Apply batch-level document_id to contents that don't have their own (backwards compatibility)
+        # 兼容旧接口：如果调用方还在使用 batch 级 document_id，就把它下沉到每个
+        # content 项里；新逻辑后续统一只按 per-item document_id 处理。
         if document_id:
             for item in contents:
                 if "document_id" not in item:
                     item["document_id"] = document_id
 
-        # Validate no duplicate document_ids in the batch
-        # Having duplicate document_ids causes race conditions in document upserts during parallel processing
+        # 同一批次里禁止重复 document_id，因为底层 retain 可能并发处理每个内容项。
+        # 如果多个 item 同时 upsert 同一个 document，会产生竞态和覆盖顺序问题。
         doc_ids = [item.get("document_id") for item in contents if item.get("document_id")]
         if len(doc_ids) != len(set(doc_ids)):
             from collections import Counter
@@ -2168,17 +2245,18 @@ class MemoryEngine(MemoryEngineInterface):
                 f"Each content item in a batch must have a unique document_id to avoid race conditions."
             )
 
-        # Auto-chunk large batches by token count to avoid timeouts and memory issues
-        # Calculate total token count
+        # 这里按 token 数而不是按 item 数切批，因为真正的成本主要取决于文本体量、
+        # LLM 输入大小和 embedding 批量规模，而不是条目数量本身。
         total_tokens = sum(count_tokens(item.get("content", "")) for item in contents)
         total_usage = TokenUsage()
 
-        # Get batch size threshold from config
+        # 批次大小阈值由配置控制，方便按模型成本、数据库能力和部署资源调优。
         config = get_config()
         tokens_per_batch = config.retain_batch_tokens
 
         if total_tokens > tokens_per_batch:
-            # Split into smaller batches based on token count
+            # 超大批次切成多个子批次，目标是把每个子批次控制在稳定可执行范围内，
+            # 避免单次 retain 占用过多内存、事务时间过长或请求超时。
             logger.info(
                 f"Large batch detected ({total_tokens:,} tokens from {len(contents)} items). Splitting into sub-batches of ~{tokens_per_batch:,} tokens each..."
             )
@@ -2190,8 +2268,8 @@ class MemoryEngine(MemoryEngineInterface):
             for item in contents:
                 item_tokens = count_tokens(item.get("content", ""))
 
-                # If adding this item would exceed the limit, start a new batch
-                # (unless current batch is empty - then we must include it even if it's large)
+                # 采用顺序贪心切分：尽量保持原顺序，只在即将超阈值时开新批次。
+                # 如果单个 item 本身就超大，也必须单独保留，不再继续拆 item 内容。
                 if current_batch and current_batch_tokens + item_tokens > tokens_per_batch:
                     sub_batches.append(current_batch)
                     current_batch = [item]
@@ -2206,10 +2284,12 @@ class MemoryEngine(MemoryEngineInterface):
 
             logger.info(f"Split into {len(sub_batches)} sub-batches: {[len(b) for b in sub_batches]} items each")
 
-            # Process each sub-batch
+            # 子批次串行执行而不是并行扇出，是为了控制总体数据库压力、避免多个
+            # 子批次同时处理同一 operation 时的状态聚合复杂度。
             all_results = []
             for i, sub_batch in enumerate(sub_batches, 1):
-                # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
+                # 子批次之间做一次 cancellation checkpoint。
+                # 如果 operation 已被删掉，继续做后面的子批次只会产生无主写入。
                 if operation_id and not await self._check_op_alive(operation_id):
                     logger.info(
                         f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping after {i - 1}/{len(sub_batches)} sub-batches"
@@ -2233,8 +2313,8 @@ class MemoryEngine(MemoryEngineInterface):
                     document_tags=document_tags,
                     operation_id=operation_id,
                     strategy=strategy,
-                    # Outbox callback runs inside the last sub-batch's transaction so the
-                    # webhook delivery row is committed atomically with the final retain data.
+                    # outbox callback 只挂到最后一个子批次上，这样 webhook row 会和
+                    # “最终完整 retain 结果”一起提交，避免前半批就提前触发完成事件。
                     outbox_callback=outbox_callback if i == len(sub_batches) else None,
                 )
                 all_results.extend(sub_results)
@@ -2246,7 +2326,7 @@ class MemoryEngine(MemoryEngineInterface):
             )
             result = all_results
         else:
-            # Small batch - use internal method directly
+            # 小批次直接走内部 retain 实现，避免不必要的切批开销。
             result, total_usage = await self._retain_batch_async_internal(
                 bank_id=bank_id,
                 contents=contents,
@@ -2260,7 +2340,8 @@ class MemoryEngine(MemoryEngineInterface):
                 outbox_callback=outbox_callback,
             )
 
-        # Call post-operation hook if validator is configured
+        # 后置 hook 放在整个批次完成后再调用，让扩展看到的是最终汇总结果，而不是
+        # 某个中间子批次的局部状态。
         if self._operation_validator:
             from hindsight_api.extensions import RetainResult
 
@@ -2283,8 +2364,8 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as e:
                 logger.warning(f"Post-retain hook error (non-fatal): {e}")
 
-        # Trigger consolidation as a tracked async operation if enabled
-        # Resolve bank-specific config to check if observations are enabled for this bank
+        # consolidation 是 retain 成功后的派生工作，不应该阻塞 retain 主结果。
+        # 因此这里只是尽力提交异步 consolidation 任务，失败只记日志不回滚 retain。
         config = await self._config_resolver.resolve_full_config(bank_id, request_context)
         if config.enable_observations:
             try:
@@ -2329,28 +2410,43 @@ class MemoryEngine(MemoryEngineInterface):
 
         Returns:
             Tuple of (unit ID lists, token usage for fact extraction)
+
+        实现原理：这个函数是 `retain_batch_async()` 的“单批次执行核心”，假设输入
+        已经被裁剪到可安全执行的大小，因此不再负责切批，只负责：
+        1. 解析这次 retain 的有效配置
+        2. 应用 strategy 覆盖
+        3. 把所有依赖对象和上下文组装好
+        4. 委托给 retain orchestrator 真正执行
+
+        这样上层负责批次调度，下层 orchestrator 负责 retain 流水线细节，中间这层
+        负责把运行时上下文“装配完整”，层次会更清晰。
         """
-        # Use the new modular orchestrator
+        # 真正的 retain 细节已经拆到独立 orchestrator 模块里，MemoryEngine 在这里
+        # 只做装配和调用，不重复承载整套 retain 实现。
         from .retain import orchestrator
 
         pool = await self._get_pool()
 
-        # Resolve bank-specific config for this operation
+        # retain 配置是分层解析的，必须在这里按 bank/request_context 解析出这次
+        # 调用的最终配置，而不是直接使用全局默认值。
         resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
 
-        # Force chunks mode when LLM provider is "none" (no LLM available for fact extraction)
+        # 当 provider=none 时，说明没有可用 LLM 做事实抽取；这里强制退化到
+        # chunks 模式，并关闭 observations，保证 retain 仍可在降级路径上工作。
         if self._llm_config.provider == "none":
             resolved_config.retain_extraction_mode = "chunks"
             resolved_config.enable_observations = False
 
-        # Apply strategy overrides: explicit strategy > bank default strategy
+        # strategy 优先级是“调用显式指定 > bank 默认策略”，这样既允许按 bank 设
+        # 默认策略，也允许单次调用临时覆盖。
         from hindsight_api.config_resolver import apply_strategy
 
         effective_strategy = strategy or resolved_config.retain_default_strategy
         if effective_strategy:
             resolved_config = apply_strategy(resolved_config, effective_strategy)
 
-        # Create parent span for retain operation
+        # retain span 建在这一层，是为了把整个单批次 retain 作为一个完整操作观测，
+        # 而不是只观测底层某个子步骤。
         with create_operation_span("retain", bank_id):
             return await orchestrator.retain_batch(
                 pool=pool,

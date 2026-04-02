@@ -132,14 +132,21 @@ async def _pre_resolve_phase1(
 
     Running these outside the transaction avoids holding row locks during
     slow reads, eliminating TimeoutErrors under concurrent load.
+
+    实现原理：Phase 1 专门承接“读重、慢查询”的前置工作，把它们从核心写事务中
+    拆出去。这里主要做两件事：
+    1. 实体解析：把抽取出的实体和库里已有实体做归并
+    2. 语义 ANN：提前查出可能的语义近邻，供后续建 semantic links 使用
+
+    这样 Phase 2 进入事务时，已经拿到了大部分写入所需的上下文，只需要做
+    纯粹的原子写入，不必在持锁期间再跑 trigram/ANN 这类慢读操作。
     """
     from .link_utils import compute_semantic_links_ann
 
     user_entities_per_content = {idx: content.entities for idx, content in enumerate(contents) if content.entities}
 
-    # Use placeholder unit_ids for grouping during resolution.  The actual
-    # unit_ids are created later by insert_facts_batch inside the transaction,
-    # but entity resolution and ANN search only need them as grouping keys.
+    # Phase 1 还没有真正插入 memory_units，因此先用占位 unit_id 做分组键。
+    # 后面 Phase 2 拿到真实 UUID 后，再统一 remap 回真实 unit_ids。
     placeholder_unit_ids = [str(i) for i in range(len(processed_facts))]
     embeddings = [fact.embedding for fact in processed_facts]
 
@@ -188,6 +195,11 @@ def _remap_phase1_results(
     During Phase 1 we use str(fact_index) as placeholder unit IDs.
     After insert_facts_batch creates real UUIDs, this function replaces the
     placeholders so that all rows reference the correct memory_units.
+
+    实现原理：Phase 1 和 Phase 2 被故意拆开后，会出现一个自然问题：
+    Phase 1 先算出来的实体映射和 ANN 结果引用的是“占位 unit_id”，而真正
+    的 `memory_units.id` 要到 Phase 2 插入后才知道。这个函数就是两阶段之间
+    的桥，把前置计算结果重新绑定到真实 UUID 上。
     """
     # Build placeholder -> actual mapping
     placeholder_to_actual = {str(i): actual_id for i, actual_id in enumerate(actual_unit_ids)}
@@ -231,6 +243,15 @@ async def _insert_facts_and_links(
     """
     Phase 2 of the retain pipeline: insert facts and retrieval-critical links.
 
+    实现原理：Phase 2 是 retain 的“核心提交阶段”，只负责那些对检索正确性
+    有硬要求的数据写入，并把它们放在同一个事务里提交：
+    - memory_units
+    - unit_entities
+    - temporal / semantic / causal links
+
+    这样一旦事务成功，recall 所依赖的最关键图结构就是自洽的；而仅用于 UI
+    可视化的 entity_links 则被有意延后到事务外，避免拖长核心事务时间。
+
     Runs inside a single database transaction to ensure atomicity of the data
     that retrieval depends on (facts, unit_entities, temporal/semantic/causal links).
 
@@ -246,22 +267,22 @@ async def _insert_facts_and_links(
     phase3_context = Phase3Context()
 
     if unit_ids:
-        # Entity resolution was done in Phase 1 (separate connection).
-        # Remap placeholder IDs to actual unit IDs.
+        # 前置实体解析和 ANN 用的是占位 unit_id；进入事务后先 remap 到真实 UUID，
+        # 再做后续 link 和 unit_entities 写入。
         step_start = time.time()
         remapped_entity_to_unit, remapped_unit_to_entity_ids, remapped_semantic = _remap_phase1_results(
             resolved_entity_ids, entity_to_unit, unit_to_entity_ids, semantic_ann_links or [], unit_ids
         )
-        # Update semantic_ann_links with remapped IDs for Phase 2
+        # semantic ANN 结果里的 from_id 也要同步替换成真实 unit_id。
         semantic_ann_links = remapped_semantic
-        # INSERT unit_entities (FK to memory_units, must be in transaction)
+        # `unit_entities` 直接依赖 memory_units 外键，因此必须留在同一事务内。
         unit_entity_pairs = [
             (unit_id, resolved_entity_ids[idx])
             for idx, (unit_id, _local_idx, _fact_date) in enumerate(remapped_entity_to_unit)
         ]
         await entity_resolver.link_units_to_entities_batch(unit_entity_pairs, conn=conn)
         log_buffer.append(f"  Insert unit_entities: {len(unit_entity_pairs)} pairs in {time.time() - step_start:.3f}s")
-        # Save context for Phase 3 entity link building (after commit)
+        # 把 Phase 3 需要的上下文保存下来，等事务提交成功后再做 UI 用的 entity links。
         phase3_context = Phase3Context(
             unit_ids=unit_ids,
             resolved_entity_ids=resolved_entity_ids,
@@ -274,7 +295,8 @@ async def _insert_facts_and_links(
         temporal_link_count = await link_creation.create_temporal_links_batch(conn, bank_id, unit_ids)
         log_buffer.append(f"  Temporal links: {temporal_link_count} links in {time.time() - step_start:.3f}s")
 
-        # Create semantic links (within-batch + pre-computed ANN from Phase 1)
+        # semantic links 既包括批内直接建立的关系，也包括 Phase 1 预先查好的 ANN
+        # 候选，两者合并后统一入库。
         if skip_semantic_links:
             log_buffer.append("  Semantic links: skipped (deferred to final ANN pass)")
             semantic_link_count = 0
@@ -290,16 +312,15 @@ async def _insert_facts_and_links(
             )
             log_buffer.append(f"  Semantic links: {semantic_link_count} links in {time.time() - step_start:.3f}s")
 
-        # NOTE: Entity links are NOT inserted here. They are deferred to
-        # Phase 3 (post-transaction, best-effort) since retrieval uses the
-        # unit_entities self-join instead. Entity links only serve UI visualization.
+        # entity_links 故意不放在这里。检索依赖的是 unit_entities 及其 self-join，
+        # 而 entity_links 主要服务 UI 展示，不值得占用核心事务时间。
 
         # Create causal links
         step_start = time.time()
         causal_link_count = await link_creation.create_causal_links_batch(conn, bank_id, unit_ids, processed_facts)
         log_buffer.append(f"  Causal links: {causal_link_count} links in {time.time() - step_start:.3f}s")
 
-    # Map results back to original content items
+    # 最后把事实级 unit_ids 重新映射回内容级结果，保持 API 返回结构稳定。
     result_unit_ids = _map_results_to_contents(contents, extracted_facts, unit_ids if unit_ids else [])
 
     if outbox_callback:
@@ -317,6 +338,10 @@ async def _build_and_insert_entity_links_phase3(
 ) -> None:
     """
     Phase 3 helper: build entity links from resolved data and insert them.
+
+    实现原理：Phase 3 是“事务后补充阶段”。它只处理 entity_links 这种对检索
+    不是硬依赖、但对图谱展示有帮助的数据。这样即使这里失败，也不会破坏 retain
+    主结果，只会影响 UI 上图谱的丰富度。
 
     Runs on a fresh connection after the main transaction has committed.
     Entity links are for UI graph visualization only — retrieval uses
@@ -341,7 +366,7 @@ async def _build_and_insert_entity_links_phase3(
             p3_entity_to_unit,
             p3_unit_to_entity_ids,
             log_buffer,
-            skip_unit_entities_insert=True,  # Already inserted in Phase 2
+            skip_unit_entities_insert=True,  # Phase 2 已经写过 FK 关键数据，这里只补 UI links
         )
         if entity_links:
             await entity_processing.insert_entity_links_batch(conn, entity_links, bank_id)
@@ -366,8 +391,20 @@ async def _extract_and_embed(
 
     Returns:
         Tuple of (extracted_facts, processed_facts, chunks_metadata, usage)
+
+    实现原理：这是 retain 流水线里最核心的“语义生成阶段”，负责把原始内容变成
+    后续可入库的 `ProcessedFact`。它只做两步：
+    1. 从 contents 中抽取 facts，同时产出 chunk 元数据和 token usage
+    2. 把抽取出的 facts 变成 embedding，并封装成 `ProcessedFact`
+
+    之所以把这两步合在一个共享函数里，是因为无论走普通 retain、delta retain
+    还是 streaming retain，真正的前置语义加工都一样，适合集中复用。
     """
     step_start = time.time()
+    # 事实抽取阶段会同时返回：
+    # - extracted_facts：后续要落库/建链接的事实
+    # - chunks：原始 chunk 元数据，用于文档追踪和 delta retain
+    # - usage：LLM token 使用量，供计费/审计/返回值使用
     extracted_facts, chunks, usage = await fact_extraction.extract_facts_from_contents(
         contents, llm_config, agent_name, config, pool, operation_id, schema
     )
@@ -377,17 +414,25 @@ async def _extract_and_embed(
     )
 
     if not extracted_facts:
+        # 没抽到事实时直接短路，不再浪费 embedding 调用；但 chunk 元数据和 usage
+        # 仍然需要保留给上层流程使用。
         return extracted_facts, [], chunks, usage
 
     if fact_type_override:
+        # 覆盖 fact_type 是上层业务策略，不改变抽取文本本身，只是在进入 embedding
+        # 和写库前统一修正事实类别。
         for fact in extracted_facts:
             fact.fact_type = fact_type_override
 
     step_start = time.time()
+    # embedding 之前先把日期等时间信号拼进文本，目的是让向量同时编码语义内容和
+    # 可读时间上下文，从而改善时间相关 recall 的相关性。
     augmented_texts = embedding_processing.augment_texts_with_dates(extracted_facts, format_date_fn)
     embeddings = await embedding_processing.generate_embeddings_batch(embeddings_model, augmented_texts)
     log_buffer.append(f"  Generate embeddings: {len(embeddings)} embeddings in {time.time() - step_start:.3f}s")
 
+    # `ProcessedFact` 是后续所有阶段的统一输入：它把抽取结果和 embedding 绑定在
+    # 一起，后续 Phase 1/2/3 都只操作这一种结构。
     processed_facts = [ProcessedFact.from_extracted_fact(ef, emb) for ef, emb in zip(extracted_facts, embeddings)]
 
     return extracted_facts, processed_facts, chunks, usage
@@ -417,6 +462,16 @@ async def retain_batch(
     Supports delta retain: when upserting a document that already has chunks,
     only re-processes chunks whose content has changed. Unchanged chunks keep
     their existing facts, entities, and links.
+
+    实现原理：`retain_batch()` 是 retain orchestrator 的总调度入口，负责根据
+    输入批次的结构选择最合适的执行路径，而不是直接把所有 retain 细节塞进一个
+    巨型事务里。它主要做三层调度：
+    1. 如果一批内容里混有多个不同 `document_id`，先按文档拆组分别处理
+    2. 如果是单文档 upsert，优先尝试 delta retain，只重算变更 chunks
+    3. 如果 delta retain 不适用，再走统一的 streaming retain 管线
+
+    这样设计的核心价值是把“多文档分组”“增量更新”“大文档流式处理”三类复杂度
+    分开处理，既保证语义正确，也控制住内存、事务时长和重试恢复成本。
     """
     start_time = time.time()
     total_chars = sum(len(item.get("content", "")) for item in contents_dicts)
@@ -427,16 +482,18 @@ async def retain_batch(
     log_buffer.append(f"Batch size: {len(contents_dicts)} content items, {total_chars:,} chars")
     log_buffer.append(f"{'=' * 60}")
 
-    # Get bank profile
+    # bank profile 在 retain 里主要用于获取 agent_name，供事实抽取阶段的提示词
+    # 和审计/日志使用。
     profile = await bank_utils.get_bank_profile(pool, bank_id)
     agent_name = profile["name"]
 
-    # Convert dicts to RetainContent objects
+    # 先把外部传入的 dict 规范化成内部 `RetainContent`，后续各阶段只依赖统一
+    # 的结构，避免在流水线中反复做原始 dict 兼容判断。
     contents = _build_contents(contents_dicts, document_tags)
 
-    # When contents have multiple distinct per-content document_ids and no
-    # batch-level document_id, group by doc_id and process each group
-    # independently so each document is tracked separately.
+    # 一次 batch 里如果混有多个 document_id，就不能把它们当成一个“单文档更新”
+    # 来处理，否则 delta retain、chunk 跟踪和文档元数据更新都会串掉。
+    # 因此这里先按文档拆组，再递归调用 retain_batch，让每个文档维持独立语义。
     if not document_id:
         per_content_doc_ids = [item.get("document_id") for item in contents_dicts]
         unique_doc_ids = {d for d in per_content_doc_ids if d}
@@ -453,7 +510,8 @@ async def retain_batch(
                 groups[doc_key][1].append(c)
                 original_indices[doc_key].append(idx)
 
-            # Process each group and merge results back in original order
+            # 分组处理后再按原始输入顺序把结果拼回去，保证调用方仍能按输入项索引
+            # 对应到返回的 unit_ids。
             result_unit_ids: list[list[str]] = [[] for _ in contents_dicts]
             total_usage = TokenUsage()
             for doc_key, (group_dicts, group_contents) in groups.items():
@@ -481,9 +539,9 @@ async def retain_batch(
                 total_usage = total_usage + group_usage
             return result_unit_ids, total_usage
 
-    # Resolve effective document_id early so both delta and streaming paths
-    # can find existing chunks from a prior attempt. On retry, the generated
-    # document_id is recovered from operation result_metadata.
+    # 尽早解析出“这次 retain 最终对应哪个 document_id”。
+    # 因为无论 delta retain 还是 streaming retain，都需要依赖稳定的 document_id
+    # 查找历史 chunks；重试时还要能复用上一次已生成的 document_id。
     effective_doc_id = document_id
     if not effective_doc_id:
         doc_ids = {item.get("document_id") for item in contents_dicts if item.get("document_id")}
@@ -507,7 +565,8 @@ async def retain_batch(
             pass
     if not effective_doc_id:
         effective_doc_id = str(uuid.uuid4())
-        # Persist so retries reuse the same document_id
+        # 新生成的 document_id 要写回 operation metadata，这样任务重试时仍能
+        # 指向同一个 document，而不是每次生成新文档造成重复数据。
         if operation_id:
             try:
                 async with acquire_with_retry(pool) as conn:
@@ -523,7 +582,8 @@ async def retain_batch(
             except Exception:
                 logger.warning("Failed to persist generated document_id", exc_info=True)
 
-    # --- Delta retain: check if we can skip unchanged chunks ---
+    # 第一次处理某个文档时优先尝试 delta retain。
+    # 如果已有 chunks 且能识别变更范围，就只重做变化部分，避免整篇文档全量重算。
     if is_first_batch:
         delta_result = await _try_delta_retain(
             pool,
@@ -549,6 +609,9 @@ async def retain_batch(
         if delta_result is not None:
             return delta_result
 
+    # delta retain 不适用时，统一走 streaming retain。
+    # 即使是小文档也走同一路径，只不过最后通常只形成一个 mini-batch。
+    # 这样可以避免维护“普通 retain”和“流式 retain”两套平行实现。
     # --- Always use the streaming pipeline (producer-consumer batching) ---
     # Even small documents go through the same path — they just end up as a
     # single batch. This eliminates the maintenance burden of two separate
@@ -557,6 +620,8 @@ async def retain_batch(
     chunk_size = getattr(config, "retain_chunk_size", 3000)
     all_pre_chunks: list[str] = []
     chunk_to_content: list[int] = []  # maps chunk index -> index into contents
+    # 预切 chunk 是 streaming retain 的输入准备阶段：先把全文切成稳定 chunks，
+    # 再按 chunk_batch_size 分成 mini-batches，控制每轮内存和事务规模。
     for content_idx, content in enumerate(contents):
         content_chunks = fact_extraction.chunk_text(content.content, chunk_size)
         all_pre_chunks.extend(content_chunks)
@@ -746,18 +811,29 @@ async def _streaming_retain_batch(
     - Delta retain can detect already-committed chunks on retry
     - The document row tracks the full content
     - Chunks are associated with the correct document
+
+    实现原理：streaming retain 是大文档的稳定执行路径。它先把全文预切成 chunks，
+    再按 `chunk_batch_size` 分成多个 mini-batches，逐批执行“抽取 -> embedding ->
+    phase1/2/3 -> commit”。每批提交后释放内存，再继续下一批。
+
+    这样做的关键价值是：
+    - 避免一次性处理超大文档导致 OOM
+    - 避免单个数据库事务过大
+    - 即使处理中途失败，已经提交的批次也能在重试时被识别和复用
     """
     total_chunks = len(all_pre_chunks)
     total_usage = TokenUsage()
     all_unit_ids: list[str] = []
 
-    # document_id is already resolved by retain_batch (includes recovery from
-    # operation result_metadata on retry).
+    # document_id 在 retain_batch 那层已经解析并持久化好了；这里直接复用，
+    # 保证所有 mini-batches 都归属于同一份 document。
     effective_doc_id = document_id
 
-    # Default template for metadata (context, event_date, etc.) when content list is empty.
+    # content list 为空时也需要一份默认模板，方便后续代码统一读取 metadata 字段。
     _default_content = RetainContent(content="")
 
+    # 这里先读取旧 chunk hashes 和文档 content hash，用来区分“同内容失败重试”
+    # 与“新内容更新同一 document”两种不同语义。
     # Load existing chunk hashes BEFORE document tracking to detect recovery.
     # If chunks exist AND the document content hash matches, this is a retry of
     # the same content — preserve existing data. If content differs, this is an
@@ -1157,8 +1233,19 @@ async def _try_delta_retain(
     """
     Attempt delta retain for a document upsert. Returns result tuple if delta
     was performed, or None to fall back to full retain.
+
+    实现原理：delta retain 的目标是“只重算发生变化的 chunks”，而不是每次文档
+    更新都把整篇内容重新抽取、重新建链接。它的判断流程是：
+    1. 读取旧 chunks 及其 content_hash
+    2. 对新内容重新切 chunk 并计算 hash
+    3. 分类为 unchanged / changed / new / removed
+    4. 只对 changed + new 的部分重新走提取和写库
+    5. 对 removed 的旧 chunks 做删除，对 unchanged 的结果直接复用
+
+    这样在大文档小改动场景下，可以显著减少 LLM、embedding 和数据库写入成本。
     """
-    # Need a single document_id
+    # delta retain 只对“单文档 upsert”有意义；如果当前批次无法唯一定位到一个
+    # document_id，就直接放弃增量路径，回退到完整 retain。
     effective_doc_id = document_id
     if not effective_doc_id:
         doc_ids = {item.get("document_id") for item in contents_dicts if item.get("document_id")}
@@ -1166,7 +1253,7 @@ async def _try_delta_retain(
             return None
         effective_doc_id = doc_ids.pop()
 
-    # Load existing chunks
+    # 先读取旧 chunks，后续的增量判断完全依赖新旧 chunk hash 比较。
     async with acquire_with_retry(pool) as conn:
         existing_chunks = await chunk_storage.load_existing_chunks(conn, bank_id, effective_doc_id)
 
@@ -1177,7 +1264,7 @@ async def _try_delta_retain(
         logger.info(f"Delta retain skipped for {effective_doc_id}: existing chunks lack content_hash (pre-migration)")
         return None
 
-    # Chunk new content and classify changes
+    # 对新内容重新切 chunk 并做差异分类，这是 delta retain 的核心判断步骤。
     step_start = time.time()
     new_chunks_with_contents = _chunk_contents_for_delta(contents, config)
     log_buffer.append(
@@ -1227,7 +1314,8 @@ async def _try_delta_retain(
             outbox_callback,
         )
 
-    # Build content items for only the changed/new chunks
+    # 只为 changed/new chunks 构造 retain 输入，避免 unchanged 部分重复进入
+    # 提取、embedding 和链接构建流程。
     delta_contents, delta_chunk_map = _build_delta_contents(contents, new_chunks_with_contents, chunks_to_process)
 
     if not delta_contents:
@@ -1258,7 +1346,7 @@ async def _try_delta_retain(
         schema,
     )
 
-    # Database transaction
+    # 进入数据库阶段前，昂贵的提取和 embedding 已经在事务外完成，避免长事务。
     result_unit_ids: list[list[str]] = []
     log_buffer_pre_db = len(log_buffer)
 

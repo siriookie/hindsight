@@ -42,7 +42,6 @@ class ClaimedTask:
     task_dict: dict[str, Any]
     schema: str | None
 
-
 class WorkerPoller:
     """
     Polls PostgreSQL for pending tasks and executes them.
@@ -51,6 +50,13 @@ class WorkerPoller:
     allowing multiple workers to process tasks without conflicts.
 
     Supports dynamic multi-tenant discovery via tenant_extension.
+
+    实现原理：`WorkerPoller` 是 broker 模式里的真正消费者。
+    上游只负责把任务写入 `async_operations.task_payload`，而 poller 负责
+    轮询数据库、原子 claim、并发执行、失败重试和状态回写。
+
+    因为“写入任务”和“执行任务”被拆开，系统既可以跑独立 worker 进程，
+    也可以在 API 进程内嵌 worker，并且可以按租户 schema 动态发现任务。
     """
 
     def __init__(
@@ -105,7 +111,13 @@ class WorkerPoller:
         self._in_flight_by_type: dict[str, int] = {}
 
     async def _get_schemas(self) -> list[str | None]:
-        """Get list of schemas to poll. Returns [None] for default schema (no prefix)."""
+        """
+        Get list of schemas to poll. Returns [None] for default schema (no prefix).
+
+        实现原理：多租户模式下，任务不会都落在同一个 schema。
+        这里每轮都动态读取 tenant_extension 返回的租户列表，而不是在启动时
+        固定下来，这样新增租户后无需重启 worker，也能被后续轮询覆盖。
+        """
         from ..config import DEFAULT_DATABASE_SCHEMA
 
         tenants = await self._tenant_extension.list_tenants()
@@ -118,6 +130,13 @@ class WorkerPoller:
 
         Returns:
             (total_available, consolidation_available) tuple
+
+        实现原理：claim 之前先按本地 in-flight 状态计算“还能再领多少任务”，
+        避免 worker 一次把太多任务改成 `processing`，但本进程并没有足够
+        执行能力，导致任务长时间堆在 processing 状态。
+
+        这里把普通任务和 consolidation 分开限流，是因为 consolidation
+        通常更重、更耗资源，而且同 bank 的 consolidation 还带有串行约束。
         """
         async with self._in_flight_lock:
             total_in_flight = self._in_flight_count
@@ -163,8 +182,18 @@ class WorkerPoller:
 
         Returns:
             List of ClaimedTask objects containing operation_id, task_dict, and schema
+
+        实现原理：这一层只负责“跨 schema 的调度编排”，不直接写 claim SQL。
+        它先拿到当前 worker 的剩余并发额度，再按 schema 逐个尝试 claim：
+        - `remaining_total` 控制本 worker 的总并发上限
+        - `remaining_consolidation` 控制重任务的独立额度
+
+        这样做的价值是把“跨租户分发”和“单 schema 原子 claim”拆开，
+        从而保证一轮轮询里不会因为前面某个 schema 领太多任务而突破全局
+        slot 限制。
         """
-        # Calculate available slots
+        # 先按本地执行状态计算还能认领多少任务；如果没有空位，直接返回，
+        # 避免无意义地访问数据库。
         total_available, consolidation_available = await self._get_available_slots()
 
         if total_available <= 0:
@@ -179,9 +208,12 @@ class WorkerPoller:
             if remaining_total <= 0:
                 break
 
+            # 单个 schema 内的 claim 由子函数在事务里完成；这里负责把当前轮
+            # 剩余额度传下去，确保跨 schema 总量不会超领。
             tasks = await self._claim_batch_for_schema(schema, remaining_total, remaining_consolidation)
 
-            # Update remaining slots based on what was claimed
+            # consolidation 有独立上限，因此要根据本轮实际领到的任务类型回扣
+            # 对应额度；否则后续 schema 仍可能继续领到过多 consolidation。
             for task in tasks:
                 op_type = task.task_dict.get("operation_type", "unknown")
                 if op_type == "consolidation":
@@ -195,7 +227,13 @@ class WorkerPoller:
     async def _claim_batch_for_schema(
         self, schema: str | None, limit: int, consolidation_limit: int
     ) -> list[ClaimedTask]:
-        """Claim tasks from a specific schema respecting slot limits."""
+        """
+        Claim tasks from a specific schema respecting slot limits.
+
+        实现原理：这是一个容错包装层。
+        单个 schema claim 失败时，只记录日志并返回空结果，不让某个租户的
+        表、索引或连接异常拖垮整个 worker 主轮询循环。
+        """
         try:
             return await self._claim_batch_for_schema_inner(schema, limit, consolidation_limit)
         except Exception as e:
@@ -207,14 +245,37 @@ class WorkerPoller:
     async def _claim_batch_for_schema_inner(
         self, schema: str | None, limit: int, consolidation_limit: int
     ) -> list[ClaimedTask]:
-        """Inner implementation for claiming tasks from a specific schema with slot limits."""
+        """
+        Inner implementation for claiming tasks from a specific schema with slot limits.
+
+        实现原理：这里是整个 worker 领取任务的核心。
+        它在一个数据库事务里完成三件事：
+        1. 用 `FOR UPDATE SKIP LOCKED` 选出可领取的 pending 任务
+        2. 把这些任务统一更新成 `processing`
+        3. 把 `task_payload` 解析成内存里的 `ClaimedTask`
+
+        把“选中”和“更新状态”放在同一个事务里，是为了保证分布式 worker
+        并发下同一条任务不会被多个进程重复领取。
+        """
         table = fq_table("async_operations", schema)
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                # Strategy: Claim non-consolidation tasks first, then consolidation up to limit
+                # 领取策略分两段：
+                # 1. 先拿普通任务，尽量提升整体吞吐。
+                # 2. 再拿 consolidation，但受独立限额控制。
+                #
+                # 这样做是因为 consolidation 往往更重，而且可能触发更高的 LLM
+                # 或数据库成本；如果与普通任务共享同一配额，容易把 worker
+                # 资源全部吃满，导致轻任务延迟变差。
 
-                # 1. Claim non-consolidation tasks (up to limit)
+                # 先 claim 非 consolidation 任务。
+                # `FOR UPDATE SKIP LOCKED` 的关键含义是：
+                # - `FOR UPDATE`：锁住当前选中的行
+                # - `SKIP LOCKED`：如果别的 worker 已锁住某行，就跳过它
+                #
+                # 这样多个 worker 可以并发扫同一张表，但不会互相阻塞，也不会
+                # 抢到同一条 pending 任务。
                 non_consolidation_rows = await conn.fetch(
                     f"""
                     SELECT operation_id, task_payload, retry_count
@@ -233,7 +294,9 @@ class WorkerPoller:
                 claimed_count = len(non_consolidation_rows)
                 remaining_limit = limit - claimed_count
 
-                # 2. Claim consolidation tasks (up to consolidation_limit and remaining_limit)
+                # consolidation 任务的 claim 附带了额外约束：
+                # 同一个 bank 在同一时刻最多只允许一个 consolidation 处于
+                # processing，避免同 bank 内部的聚合/刷新逻辑并发冲突。
                 consolidation_rows = []
                 if consolidation_limit > 0 and remaining_limit > 0:
                     consolidation_rows = await conn.fetch(
@@ -262,7 +325,9 @@ class WorkerPoller:
                 if not all_rows:
                     return []
 
-                # Claim the tasks by updating status and worker_id
+                # 只有在同一事务里把这些行改成 processing，claim 才算真正成立。
+                # 如果只 SELECT 不 UPDATE，事务结束后别的 worker 仍可能再次选中
+                # 这些任务，造成重复执行。
                 operation_ids = [row["operation_id"] for row in all_rows]
                 await conn.execute(
                     f"""
@@ -274,7 +339,9 @@ class WorkerPoller:
                     operation_ids,
                 )
 
-                # Parse and return task payloads with schema context
+                # 任务在库里是 JSONB，worker 在内存里需要可执行的 dict。
+                # 这里顺便注入 `_retry_count` 和 `_operation_id`，让执行阶段无需
+                # 再回头查库就能知道重试次数和真实 operation 标识。
                 result = []
                 for row in all_rows:
                     task_dict = json.loads(row["task_payload"])
@@ -398,7 +465,7 @@ class WorkerPoller:
                 f"{'failed' if any_failed else 'completed'} (all siblings done)"
             )
         except Exception as e:
-            # Log but don't re-raise — the child has already been marked failed,
+            # Log but don't re-raise - the child has already been marked failed,
             # which is the critical state change. A stuck parent will be caught on
             # the next run or via monitoring.
             logger.error(f"Failed to update parent operation for child {child_operation_id}: {e}")
@@ -421,21 +488,30 @@ class WorkerPoller:
         logger.warning(f"Task {operation_id} scheduled for retry at {retry_at}: {error_message}")
 
     async def execute_task(self, task: ClaimedTask):
-        """Execute a single task as a background job (fire-and-forget)."""
+        """
+        Execute a single task as a background job (fire-and-forget).
+
+        实现原理：claim 和执行是解耦的。
+        这里不会同步等待任务跑完，而是把每个已 claim 任务包装成后台
+        `asyncio.Task`，这样 poller 主循环可以立刻回去继续 claim 下一批任务，
+        从而把数据库领取和业务执行并行起来。
+        """
         task_type = task.task_dict.get("type", "unknown")
         operation_type = task.task_dict.get("operation_type", "unknown")
         bank_id = task.task_dict.get("bank_id", "unknown")
 
-        # Create background task
+        # fire-and-forget 让领取循环不被单个长任务阻塞；真正的生命周期管理
+        # 依赖下面的本地 in-flight 计数和 done callback。
         bg_task = asyncio.create_task(self._execute_task_inner(task))
 
-        # Track this task as active
+        # 本地计数是 slot 限流的真实依据，因此必须在任务启动后立即登记，
+        # 否则主循环可能误以为还有空闲容量，继续超额 claim。
         async with self._in_flight_lock:
             self._active_tasks[task.operation_id] = (task_type, bank_id, task.schema, bg_task)
             self._in_flight_count += 1
             self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
 
-        # Add cleanup callback
+        # 用 done callback 统一回收本地状态，避免每个执行分支都手写清理逻辑。
         bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
 
     async def _cleanup_task(self, operation_id: str, operation_type: str):
@@ -456,7 +532,16 @@ class WorkerPoller:
         Tasks that want to be retried raise RetryTaskAt; the poller sets next_retry_at
         and resets status to 'pending'. All other exceptions are marked as failed immediately.
         Non-retryable failures (e.g., file_convert_retain) are handled by the executor
-        internally — it marks the operation as failed and returns normally.
+        internally - it marks the operation as failed and returns normally.
+
+        实现原理：poller 只负责通用调度语义，不负责理解具体业务任务。
+        所以这里把执行结果压缩成三类：
+        - 正常返回：任务完成
+        - 抛 `RetryTaskAt`：任务希望延后重试
+        - 抛其他异常：任务失败，poller 统一落失败状态
+
+        这种分层让具体 handler 只表达“业务是否需要重试”，而不需要每个 handler
+        自己重复写一遍状态机更新逻辑。
         """
         task_type = task.task_dict.get("type", "unknown")
         bank_id = task.task_dict.get("bank_id", "unknown")
@@ -465,6 +550,9 @@ class WorkerPoller:
             schema_info = f", schema={task.schema}" if task.schema else ""
             logger.debug(f"Executing task {task.operation_id} (type={task_type}, bank={bank_id}{schema_info})")
             if task.schema:
+                # schema 不是业务 payload 的一部分，而是执行上下文的一部分。
+                # 这里在真正调用 executor 前注入 `_schema`，让 MemoryEngine 能在
+                # 正确的租户 schema 下查询和更新数据。
                 task.task_dict["_schema"] = task.schema
             await self._executor(task.task_dict)
             logger.debug(f"Task {task.operation_id} execution finished")
@@ -489,6 +577,13 @@ class WorkerPoller:
 
         Returns:
             Number of tasks recovered
+
+        实现原理：worker 崩溃时，数据库里可能残留一批 `processing` 任务。
+        如果不在重启时回收，这些任务会永远卡住，因为普通 claim 逻辑只看
+        `pending` 状态。
+
+        因此 worker 启动后会先把“属于自己 worker_id 的 processing 任务”
+        重置回 pending，让它们重新进入可领取队列。
         """
         schemas = await self._get_schemas()
         total_count = 0
@@ -497,11 +592,13 @@ class WorkerPoller:
             try:
                 table = fq_table("async_operations", schema)
 
-                # First, recover batch API operations (before resetting worker tasks)
+                # batch API 任务有额外生命周期，先单独恢复，再恢复普通任务，
+                # 避免两套恢复规则互相覆盖。
                 batch_count = await self._recover_batch_operations(schema)
                 total_count += batch_count
 
-                # Then reset normal worker tasks
+                # 这里只恢复“上次由本 worker 认领”的 processing 任务，
+                # 不碰其他 worker 的进行中任务，避免误抢活跃实例的工作。
                 result = await self._pool.execute(
                     f"""
                     UPDATE {table}
@@ -603,6 +700,16 @@ class WorkerPoller:
 
         Continuously polls for pending tasks, spawns them as background tasks,
         and immediately continues polling (up to slot limits).
+
+        实现原理：这个循环本质上是一个轻量调度器：
+        - 启动先恢复上次异常退出遗留的 processing 任务
+        - 每轮 claim 一批任务
+        - 把它们交给后台执行
+        - 如果本轮领到了任务，就立刻继续下一轮，尽快填满可用 slot
+        - 如果没领到任务，再按 poll_interval 休眠
+
+        这种“有活就快速连拉、没活才 sleep”的模式，比固定周期只拉一批
+        吞吐更高，也能在队列变空时避免忙等。
         """
         await self.recover_own_tasks()
 
@@ -613,7 +720,8 @@ class WorkerPoller:
 
         while not self._shutdown.is_set():
             try:
-                # Claim a batch of tasks (respecting slot limits)
+                # claim 是同步拿任务，执行是异步后台跑；两者分离后，主循环就能
+                # 尽量持续把本 worker 的并发槽位填满。
                 tasks = await self.claim_batch()
 
                 if tasks:
@@ -637,15 +745,16 @@ class WorkerPoller:
                         f"({consolidation_count} consolidation): {types_str} (schemas: {schemas_str})"
                     )
 
-                    # Spawn tasks as background jobs (fire-and-forget)
+                    # 这里只负责把任务发射出去，不等待完成；slot 回收由
+                    # execute_task -> done callback -> _cleanup_task 负责。
                     for task in tasks:
                         await self.execute_task(task)
 
-                    # Continue immediately to claim more tasks (if slots available)
+                    # 本轮既然拿到了任务，就说明队列里大概率还有货，立即进入
+                    # 下一轮比 sleep 更能提高吞吐。
                     continue
 
-                # No tasks claimed (either no pending tasks or slots full)
-                # Wait before polling again
+                # 没有任务可领时再 sleep，避免对数据库形成空转轮询压力。
                 try:
                     await asyncio.wait_for(
                         self._shutdown.wait(),
