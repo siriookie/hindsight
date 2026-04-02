@@ -393,14 +393,24 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
 
     Returns:
         List of text chunks, roughly under max_chars
+
+    实现原理：这是 retain 阶段最底层的切块函数，目标不是做“最聪明的语义切分”，
+    而是做“稳定、可恢复、足够保守”的切分：
+    1. 小文本不切，直接整块返回
+    2. 如果文本长得像 JSON 对话数组，就按 turn 边界切
+    3. 否则按段落/换行/句子/词语逐级退化切分
+
+    这样既能尽量保留自然边界，又能保证 chunk 切分规则足够稳定，方便 delta retain
+    用 `chunk_index + content_hash` 识别哪些块发生了变化。
     """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-    # If text is small enough, return as-is
+    # 小文本直接保留为一个 chunk，避免不必要的切分导致索引漂移。
     if len(text) <= max_chars:
         return [text]
 
-    # Try to parse as JSON conversation array
+    # 会话 JSON 需要优先走专门路径，因为普通句子切分会破坏对话 turn 边界，
+    # 影响后续 fact 提取中的说话者语义。
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
@@ -409,7 +419,7 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Fall back to sentence-aware text splitting
+    # 普通文本走递归字符切分，但优先按“更自然的边界”切，而不是直接硬按字符数截断。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=max_chars,
         chunk_overlap=0,
@@ -1460,10 +1470,16 @@ async def extract_facts_from_text(
         - facts: List of Fact model instances
         - chunks: List of tuples (chunk_text, fact_count) for each chunk
         - usage: Aggregated token usage across all LLM calls
+
+    实现原理：这是“单条文本 -> LLM facts”的核心入口。
+    它会先把一段长文本切成多个 chunks，然后对每个 chunk 并行调用 LLM 抽取，
+    最后把结果重新汇总。注意这里的输出还是 LLM 层的 Fact 模型，不是最终写库用的
+    `ExtractedFactType`，后者要在更上层 orchestration 里再补齐索引、chunk 映射
+    和上下文字段。
     """
     chunks = chunk_text(text, max_chars=config.retain_chunk_size)
 
-    # Log chunk count before starting LLM requests
+    # 先记录切块规模，方便定位“文本过长导致提取慢/贵”的问题。
     total_chars = sum(len(c) for c in chunks)
     if len(chunks) > 1:
         logger.debug(
@@ -1586,6 +1602,16 @@ async def extract_facts_from_contents_batch_api(
 
     Returns:
         Tuple of (extracted_facts, chunks_metadata, usage)
+
+    实现原理：这是 `extract_facts_from_contents()` 的 Batch API 分支。
+    当 provider 支持批处理时，它不会逐 chunk 立即同步调用 LLM，而是：
+    1. 先把所有 chunks 组装成 batch requests
+    2. 一次性提交给 provider
+    3. 轮询等待 batch 完成
+    4. 再把批处理结果重新映射回 chunk/content 结构
+
+    这样适合高吞吐、大批量 retain 场景，也支持把 `batch_id` 写入 operation metadata，
+    让 worker 崩溃后可以恢复轮询而不是重新提交整批请求。
     """
     if not contents:
         return [], [], TokenUsage()
@@ -1596,12 +1622,13 @@ async def extract_facts_from_contents_batch_api(
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
-    # Check if provider supports batch API
+    # batch 模式是能力增强，不是强依赖；provider 不支持时要平滑回退到同步模式。
     if not await llm_config._provider_impl.supports_batch_api():
         logger.warning(f"Batch API not supported for provider {llm_config.provider}, falling back to sync mode")
         return await extract_facts_from_contents(contents, llm_config, agent_name, config, pool, operation_id, schema)
 
-    # Check if we're resuming an existing batch (crash recovery)
+    # 如果 operation metadata 里已经有 batch_id，说明这次是 crash recovery，
+    # 应当继续轮询旧 batch，而不是重复提交一份新的 batch 请求。
     batch_id = None
     if operation_id and pool:
         from ..task_backend import fq_table
@@ -1621,7 +1648,8 @@ async def extract_facts_from_contents_batch_api(
             if batch_id:
                 logger.info(f"Resuming existing batch: batch_id={batch_id} (crash recovery)")
 
-    # Step 1: Chunk all contents and build batch requests (skip if resuming)
+    # 先把所有 content 展平成 chunk 请求队列；后续 batch 结果会按 custom_id
+    # 再映射回 content_index 和 chunk_index_in_content。
     all_chunks_info = []  # List of (chunk_text, content_index, chunk_index_in_content, event_date, context)
     batch_requests = []
 
@@ -1719,7 +1747,7 @@ async def extract_facts_from_contents_batch_api(
     # Map results by custom_id
     results_by_id = {result["custom_id"]: result for result in batch_results}
 
-    # Step 5: Parse results into facts (same as sync mode)
+    # 批处理完成后，解析逻辑仍然尽量和同步模式保持一致，这样两条路径的语义更容易对齐。
     all_facts_from_llm = []
     chunks_metadata = []
     total_usage = TokenUsage()
@@ -2009,6 +2037,11 @@ def _extract_facts_chunks(
     """
     chunks mode: no LLM call, no entity extraction.
 
+    实现原理：这是 `retain_extraction_mode="chunks"` 时的降级路径。
+    系统不再尝试抽取结构化 facts，而是把每个 chunk 原样当作一条 world fact 存下。
+    这样在没有可用 LLM 时，系统仍能作为 chunk store 工作，至少保留原文切片和
+    基础检索能力。
+
     Each chunk becomes one memory unit with the raw text as fact_text.
     User-provided entities from RetainContent.entities are picked up downstream
     by entity_processing.py — they are the sole source of entity data in this mode.
@@ -2079,22 +2112,35 @@ async def extract_facts_from_contents(
 
     Returns:
         Tuple of (extracted_facts, chunks_metadata, usage)
+
+    实现原理：这是 retain 里“多内容项 -> 统一事实列表”的主入口。
+    它不直接做数据库写入，而是专门负责把一批 `RetainContent` 变成后续可入库的
+    `ExtractedFactType` 和 `ChunkMetadata`。整体流程是：
+    1. 根据 extraction mode 选择路径：`chunks` / `batch_api` / 普通同步模式
+    2. 如果是普通模式，对每个 content 并行调用 `extract_facts_from_text()`
+    3. 把每个 content 的 chunk/fact 结果展平成全局索引
+    4. 根据模式做 verbatim 收敛、时间偏移、自动标签注入
+
+    这层函数的关键价值是“统一语义出口”：
+    无论底层到底是直接 LLM 调用、Batch API，还是 chunks 降级模式，最终往上游
+    都返回相同结构，方便 orchestration 层继续处理。
     """
     if not contents:
         return [], [], TokenUsage()
 
-    # chunks mode: skip LLM entirely, store each chunk as-is
-    # Must come before the batch-API check so no LLM queue/locks are acquired
+    # `chunks` 模式必须最先判定，因为它代表“完全不走 LLM”。
+    # 只要命中这个分支，就不应该再触碰 Batch API 或任何 LLM 相关资源。
     if config.retain_extraction_mode == "chunks":
         return _extract_facts_chunks(contents, config)
 
-    # Route to batch API if enabled
+    # 如果启用了 batch 并且 provider 支持，就把所有内容路由到批量提取路径。
     if config.retain_batch_enabled:
         return await extract_facts_from_contents_batch_api(
             contents, llm_config, agent_name, config, pool, operation_id, schema
         )
 
-    # Step 1: Create parallel fact extraction tasks
+    # 普通模式下，以 content 为粒度并行提取。
+    # 这里不是每个 content 再自己管最终写库，而只是并行拿到“文本级抽取结果”。
     fact_extraction_tasks = []
     for item in contents:
         # Call extract_facts_from_text directly (defined earlier in this file)
@@ -2110,11 +2156,11 @@ async def extract_facts_from_contents(
         )
         fact_extraction_tasks.append(task)
 
-    # Step 2: Wait for all fact extractions to complete.
-    # Use return_exceptions=True so one content item failure doesn't discard the rest.
+    # 先等待全部内容项都返回，再统一折叠结果。
+    # `return_exceptions=True` 让单个 content 失败不会直接取消兄弟任务。
     all_fact_results = await asyncio.gather(*fact_extraction_tasks, return_exceptions=True)
 
-    # Step 3: Flatten and convert to typed objects
+    # 这里开始把“每个 content 自己的本地结果”折叠成整个批次的全局结果。
     extracted_facts: list[ExtractedFactType] = []
     chunks_metadata: list[ChunkMetadata] = []
     total_usage = TokenUsage()
@@ -2122,7 +2168,8 @@ async def extract_facts_from_contents(
     global_chunk_idx = 0
     global_fact_idx = 0
 
-    # Filter out failed content items
+    # 单个 content 提取失败时，不让它污染其它内容项；这里把它降级成空结果，
+    # 这样上层仍可继续处理成功的那些 content。
     valid_results = []
     for content, result in zip(contents, all_fact_results):
         if isinstance(result, Exception):
@@ -2135,7 +2182,7 @@ async def extract_facts_from_contents(
         total_usage = total_usage + content_usage
         chunk_start_idx = global_chunk_idx
 
-        # Convert chunk tuples to ChunkMetadata objects
+        # 先建立 chunk 的全局索引。后面 facts 会通过 `chunk_index` 指回这些 chunks。
         for chunk_index_in_content, (chunk_text, chunk_fact_count) in enumerate(chunks_from_llm):
             chunk_metadata = ChunkMetadata(
                 chunk_text=chunk_text,
@@ -2146,7 +2193,8 @@ async def extract_facts_from_contents(
             chunks_metadata.append(chunk_metadata)
             global_chunk_idx += 1
 
-        # Convert facts to ExtractedFact objects with proper indexing
+        # 再把 LLM 的 Fact 模型补齐成 retain 层统一使用的 `ExtractedFactType`，
+        # 并把 content/chunk/global fact 索引全部固定下来。
         fact_idx_in_content = 0
         for chunk_idx_in_content, (chunk_text, chunk_fact_count) in enumerate(chunks_from_llm):
             chunk_global_idx = chunk_start_idx + chunk_idx_in_content
@@ -2155,8 +2203,8 @@ async def extract_facts_from_contents(
                 if fact_idx_in_content < len(facts_from_llm):
                     fact_from_llm = facts_from_llm[fact_idx_in_content]
 
-                    # Convert Fact model from LLM to ExtractedFactType dataclass
-                    # mentioned_at is always the event_date (when the conversation/document occurred)
+                    # `mentioned_at` 始终来自原 content 的 event_date；而发生时间
+                    # `occurred_start/end` 则由 LLM 按具体 fact 内容判断。
                     extracted_fact = ExtractedFactType(
                         fact_text=fact_from_llm.fact,
                         fact_type="experience" if fact_from_llm.fact_type == "assistant" else "world",
@@ -2185,14 +2233,16 @@ async def extract_facts_from_contents(
                     global_fact_idx += 1
                     fact_idx_in_content += 1
 
-    # Step 4: For verbatim mode, collapse to one fact per chunk with original text
+    # verbatim 模式要求“一块一个 fact，且 fact_text 就是原始 chunk 文本”。
+    # 即使 LLM 误返回多个 fact，这里也要收敛成 chunk 粒度。
     if config.retain_extraction_mode == "verbatim":
         extracted_facts = _collapse_to_verbatim(extracted_facts, chunks_metadata)
 
-    # Step 5: Add time offsets to preserve ordering within each content
+    # 给所有时间字段加细粒度偏移，避免同批 facts 拥有完全相同的时间戳，导致
+    # 检索和排序阶段丢失原始先后顺序。
     _add_temporal_offsets(extracted_facts, contents)
 
-    # Step 6: Auto-tag facts from label groups with tag=True
+    # 根据 label groups 自动补 tags，把实体标签策略下沉到事实级数据。
     _inject_label_tags(extracted_facts, config)
 
     return extracted_facts, chunks_metadata, total_usage
@@ -2205,6 +2255,12 @@ def _collapse_to_verbatim(facts: list[ExtractedFactType], chunks: list[ChunkMeta
     The LLM prompt asks for exactly one fact per chunk, but if it returns more,
     this collapses them: keeps the first fact as representative, overrides its
     fact_text with the raw chunk text, and merges entities from any extra facts.
+
+    实现原理：verbatim 模式并不信任 LLM 一定严格遵守“一块一个 fact”的约束，
+    所以这里做最后一道收敛：
+    - 每个 chunk 只保留一个代表 fact
+    - 代表 fact 的 `fact_text` 被强制改回原始 chunk 文本
+    - 额外返回的 facts 只贡献实体，不再作为独立 fact 保留
     """
     chunk_text_map = {c.chunk_index: c.chunk_text for c in chunks}
     seen: dict[int, ExtractedFactType] = {}
@@ -2263,6 +2319,11 @@ def _add_temporal_offsets(facts: list[ExtractedFactType], contents: list[RetainC
     Uses absolute position across all facts to ensure unique timestamps.
 
     Modifies facts in place.
+
+    实现原理：很多 facts 共享同一个 `event_date` 或 `mentioned_at`。如果完全保留
+    原值，后续按时间排序时会出现大量并列，丢失“原文中先后出现的顺序”。
+    因此这里按全局 fact 顺序为时间字段加一个极小偏移量，既不破坏原始日期语义，
+    又能稳定保留事实顺序。
     """
     from .orchestrator import parse_datetime_flexible
 
