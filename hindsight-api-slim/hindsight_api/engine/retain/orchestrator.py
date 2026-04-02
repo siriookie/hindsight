@@ -141,16 +141,24 @@ async def _pre_resolve_phase1(
     这样 Phase 2 进入事务时，已经拿到了大部分写入所需的上下文，只需要做
     纯粹的原子写入，不必在持锁期间再跑 trigram/ANN 这类慢读操作。
     """
+    # 延迟导入语义 ANN 辅助函数，避免模块级循环依赖。
     from .link_utils import compute_semantic_links_ann
 
+    # 把每条原始 content 上用户显式提供的实体，整理成以 content_index 为键的映射。
+    # 后面的实体解析会把这些用户实体与 LLM 抽取到的实体合并处理。
     user_entities_per_content = {idx: content.entities for idx, content in enumerate(contents) if content.entities}
 
     # Phase 1 还没有真正插入 memory_units，因此先用占位 unit_id 做分组键。
     # 后面 Phase 2 拿到真实 UUID 后，再统一 remap 回真实 unit_ids。
+    # 这里的占位 unit_id 只是本批次内的临时编号，不会直接写入数据库。
     placeholder_unit_ids = [str(i) for i in range(len(processed_facts))]
+    # 提前取出每条 fact 的 embedding，后面做语义 ANN 查询时直接复用。
     embeddings = [fact.embedding for fact in processed_facts]
 
+    # 使用独立数据库连接执行这一阶段，避免把慢读操作放进主写事务里。
     async with acquire_with_retry(pool) as resolve_conn:
+        # 先做实体解析：
+        # 把当前批次 fact 中的实体名称归并到库里的 canonical entity id。
         resolved_entity_ids, entity_to_unit, unit_to_entity_ids = await entity_processing.resolve_entities(
             entity_resolver,
             resolve_conn,
@@ -165,19 +173,29 @@ async def _pre_resolve_phase1(
         # Semantic ANN search on the same connection (autocommit, no transaction).
         # Skipped in streaming mode — deferred to Phase 3 to avoid O(bank_size)
         # scaling bottleneck that makes later streaming batches progressively slower.
+        # 先默认没有语义 ANN 结果。
         semantic_ann_links = []
+        # 如果当前模式允许，就在事务外提前查语义近邻。
         if not skip_semantic_ann:
+            # 收集每条 fact 的类型，供 ANN 结果过滤或打分时使用。
             fact_types = [fact.fact_type for fact in processed_facts]
+            # 基于 embedding 和占位 unit_id 查询可能的语义近邻 links。
             semantic_ann_links = await compute_semantic_links_ann(
                 resolve_conn, bank_id, placeholder_unit_ids, embeddings, fact_types=fact_types, log_buffer=log_buffer
             )
 
+    # 把 Phase 1 得到的实体解析结果和语义 ANN 结果封装后返回，
+    # 供后面的事务写入阶段直接复用。
     return Phase1Result(
         entities=EntityResolutionResult(
+            # 与扁平化实体列表顺序一一对应的 canonical entity id 列表。
             resolved_entity_ids=resolved_entity_ids,
+            # 记录“第几个解析实体”属于哪个占位 unit_id。
             entity_to_unit=entity_to_unit,
+            # 记录每个占位 unit_id 最终关联了哪些 entity id。
             unit_to_entity_ids=unit_to_entity_ids,
         ),
+        # 事务外预计算出来的语义近邻 links。
         semantic_ann_links=semantic_ann_links,
     )
 
@@ -1351,24 +1369,35 @@ async def _try_delta_retain(
     log_buffer_pre_db = len(log_buffer)
 
     async def _run_delta_db_work() -> None:
+        # 这个内部函数负责执行 delta retain 的数据库阶段。
+        # 顺序是：事务外预解析 -> 事务内核心写入 -> 事务后补写展示型数据。
         nonlocal result_unit_ids
+        # 清掉这次 DB 阶段开始前追加的日志，避免重复累积。
         del log_buffer[log_buffer_pre_db:]
+        # 在重新入库前，先清空 processed_facts 上待回填的归属字段。
         for pf in processed_facts:
+            # 先移除旧的 document_id，后面统一回填当前文档。
             pf.document_id = None
+            # 先移除旧的 chunk_id，后面按新写入的 chunk 重新绑定。
             pf.chunk_id = None
+        # 清空 resolver 暂存的统计，避免混入上一次执行的数据。
         entity_resolver.discard_pending_stats()
 
-        # PHASE 1 — Entity Resolution + Semantic ANN (separate connection, read-heavy)
+        # Phase 1：在独立连接上做实体归一化和语义 ANN 预查询。
+        # 这些操作偏读且可能较慢，放到事务外可以显著缩短事务持锁时间。
         phase1 = await _pre_resolve_phase1(
             pool, entity_resolver, bank_id, delta_contents, processed_facts, config, log_buffer
         )
 
-        # PHASE 2 — Core Write Transaction (atomic)
+        # Phase 2：进入核心写事务，把检索依赖的关键数据原子写入数据库。
         async with acquire_with_retry(pool) as conn:
+            # 开启事务，确保 chunk / fact / link 的写入要么全部成功，要么全部回滚。
             async with conn.transaction():
-                # Update document metadata (no delete)
+                # 更新文档级元数据，但不直接删除整份文档。
                 step_start = time.time()
+                # 把当前批次内容拼成完整文档文本，用于更新文档 metadata。
                 combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
+                # 提取文档级 retain 参数和合并后的 tags。
                 retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
                 await fact_storage.upsert_document_metadata(
                     conn,
@@ -1378,35 +1407,42 @@ async def _try_delta_retain(
                     retain_params,
                     merged_tags,
                 )
+                # 记录文档元数据更新耗时。
                 log_buffer.append(f"  Document metadata update in {time.time() - step_start:.3f}s")
 
-                # Delete changed and removed chunks (cascades to memory_units and links)
+                # 删除 changed 和 removed 的旧 chunk。
                 step_start = time.time()
+                # 收集所有需要删除的 chunk_id。
                 chunks_to_delete = [
                     existing_by_index[idx].chunk_id
                     for idx in changed_indices + removed_indices
                     if idx in existing_by_index
                 ]
+                # 删除旧 chunk；相关 memory_units 和 links 会通过级联一起清理。
                 await chunk_storage.delete_chunks_by_ids(conn, chunks_to_delete)
+                # 记录删除统计。
                 log_buffer.append(
                     f"  Deleted {len(chunks_to_delete)} chunks "
                     f"({len(changed_indices)} changed + {len(removed_indices)} removed) "
                     f"in {time.time() - step_start:.3f}s"
                 )
 
-                # Update tags on unchanged chunks' memory units
+                # 对 unchanged chunk 对应的 memory_units，同步更新 tags。
                 step_start = time.time()
                 updated_count = await fact_storage.update_memory_units_tags(
                     conn, bank_id, effective_doc_id, merged_tags
                 )
+                # 记录 tags 更新结果。
                 log_buffer.append(
                     f"  Updated tags on {updated_count} existing memory units in {time.time() - step_start:.3f}s"
                 )
 
-                # Store new/changed chunks
+                # 开始存储 changed / new 的 chunk。
                 step_start = time.time()
+                # 保存 (document_id, chunk_index) -> chunk_id 的映射，供后面回填 fact 使用。
                 chunk_id_map_by_doc = {}
                 if new_chunk_metadata:
+                    # 把 delta 子集里的 chunk_index 映射回原始文档里的 chunk_index。
                     remapped_chunks = [
                         ChunkMetadata(
                             chunk_text=cm.chunk_text,
@@ -1416,27 +1452,34 @@ async def _try_delta_retain(
                         )
                         for cm in new_chunk_metadata
                     ]
+                    # 批量写入这些新 chunk，返回 chunk_index -> chunk_id 的映射。
                     chunk_id_map = await chunk_storage.store_chunks_batch(
                         conn, bank_id, effective_doc_id, remapped_chunks
                     )
+                    # 改造成带 document_id 的键，方便后续按文档和索引查询。
                     for chunk_idx, chunk_id in chunk_id_map.items():
                         chunk_id_map_by_doc[(effective_doc_id, chunk_idx)] = chunk_id
+                    # 记录新 chunk 写入耗时。
                     log_buffer.append(
                         f"  Stored {len(remapped_chunks)} new/changed chunks in {time.time() - step_start:.3f}s"
                     )
 
-                # Map chunk_ids and document_ids to processed facts
+                # 把真实 document_id / chunk_id 回填到 processed_facts。
                 for ef, pf in zip(extracted_facts, processed_facts):
+                    # 当前这批 fact 都属于当前文档。
                     pf.document_id = effective_doc_id
                     if ef.chunk_index is not None:
+                        # extracted_facts 里的 chunk_index 相对于 delta_contents，
+                        # 这里要映射回原始文档 chunk 索引。
                         original_idx = delta_chunk_map.get(ef.chunk_index, ef.chunk_index)
+                        # 取出这个原始 chunk 对应的真实 chunk_id。
                         chunk_id = chunk_id_map_by_doc.get((effective_doc_id, original_idx))
                         if chunk_id:
+                            # 找到映射后，把真实 chunk_id 写回 fact。
                             pf.chunk_id = chunk_id
 
-                # Insert facts and retrieval-critical links.
-                # Use delta_contents (the changed/new chunks) as the content list,
-                # since extracted_facts have content_index relative to delta_contents.
+                # 写入新的 facts、unit_entities，以及检索依赖的各种 links。
+                # 这里复用 Phase 1 预先算好的实体解析和 ANN 结果，避免事务内再做慢查询。
                 result_unit_ids, phase3_ctx = await _insert_facts_and_links(
                     conn,
                     entity_resolver,
@@ -1453,21 +1496,28 @@ async def _try_delta_retain(
                     outbox_callback=outbox_callback,
                 )
 
-            # PHASE 3 — Best-Effort Display Data (post-transaction)
+            # Phase 3：事务提交后，补写仅服务展示的 entity links 等数据。
             try:
+                # 先把 resolver 暂存的统计刷新出去。
                 await entity_resolver.flush_pending_stats()
+                # 构建并插入 entity links；这部分主要服务 UI，可失败但不影响检索主流程。
                 await _build_and_insert_entity_links_phase3(pool, entity_resolver, bank_id, phase3_ctx, log_buffer)
             except Exception:
-                logger.warning("Phase 3 (best-effort display data) failed — retrieval unaffected", exc_info=True)
+                # 展示型数据失败时只打 warning，不让核心 retain 结果回滚。
+                logger.warning("Phase 3 (best-effort display data) failed - retrieval unaffected", exc_info=True)
 
+            # 统计整个 delta retain 的总耗时。
             total_time = time.time() - start_time
+            # 输出收尾分隔线和汇总信息。
             log_buffer.append(f"{'=' * 60}")
             log_buffer.append(
                 f"DELTA RETAIN COMPLETE: {len(processed_facts)} new units, "
                 f"{len(unchanged_indices)} chunks unchanged in {total_time:.3f}s"
             )
+            # 记录当前处理的文档 ID。
             log_buffer.append(f"Document: {effective_doc_id}")
             log_buffer.append(f"{'=' * 60}")
+            # 把本次 delta retain 的完整日志写到 logger。
             logger.info("\n" + "\n".join(log_buffer) + "\n")
 
     if db_semaphore is not None:

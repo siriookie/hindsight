@@ -512,31 +512,50 @@ class LLMProvider:
             OutputTooLongError: If output exceeds token limits.
             Exception: Re-raises API errors after retries exhausted.
         """
+        # 进入全局并发信号量，限制整个进程里同时进行的 LLM 请求数量。
+        # 这对本地模型、限流严格的远端模型、以及整体系统稳定性都很重要。
         async with _global_llm_semaphore:
             # Delegate to provider implementation
+            # 真正的 provider-specific 调用逻辑不在这里实现，
+            # 而是统一委托给底层 provider 实现类。
             result = await self._provider_impl.call(
+                # 透传对话消息列表。
                 messages=messages,
+                # 透传结构化输出 schema；为 None 时通常返回普通文本。
                 response_format=response_format,
+                # 透传输出 token 上限。
                 max_completion_tokens=max_completion_tokens,
+                # 透传采样温度。
                 temperature=temperature,
+                # scope 用于统计、日志、追踪不同调用场景。
                 scope=scope,
+                # 透传最大重试次数。
                 max_retries=max_retries,
+                # 透传指数退避的初始等待时间。
                 initial_backoff=initial_backoff,
+                # 透传指数退避的最大等待时间。
                 max_backoff=max_backoff,
+                # 如果为 True，跳过 Pydantic 校验，直接拿原始 JSON。
                 skip_validation=skip_validation,
+                # strict_schema 主要用于 OpenAI 严格 schema 约束。
                 strict_schema=strict_schema,
+                # 如果为 True，返回值会附带 TokenUsage。
                 return_usage=return_usage,
             )
 
             # Backward compatibility: Update mock call tracking for mock provider
             # This allows existing tests using LLMProvider._mock_calls to continue working
             if self.provider == "mock":
+                # 仅在 mock provider 下，做额外的测试兼容同步。
                 from .providers.mock_llm import MockLLM
 
                 if isinstance(self._provider_impl, MockLLM):
                     # Sync the mock calls from provider implementation to wrapper
+                    # 把底层 mock provider 记录到的调用历史同步回 wrapper。
                     self._mock_calls = self._provider_impl.get_mock_calls()
 
+            # 返回底层 provider 已经处理好的结果；
+            # 具体是文本、结构化对象，还是 (result, usage) 元组，取决于入参。
             return result
 
     async def call_with_tools(
