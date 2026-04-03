@@ -735,24 +735,35 @@ async def compute_semantic_links_ann(
         List of (from_id, to_id, "semantic", similarity, None) tuples
         where from_id uses placeholder IDs.
     """
+    # 没有种子 unit 或没有向量时，后续 ANN 检索没有意义，直接返回空列表。
     if not unit_ids or not embeddings:
         return []
 
+    # 局部导入，避免模块级依赖膨胀，同时方便在性能路径里显式标注时间测量来源。
     import time as time_mod
     import uuid as uuid_mod
 
+    # 记录整个 ANN 阶段总耗时，供 retain 分阶段日志输出使用。
     ann_start = time_mod.time()
+    # 收集最终通过阈值过滤的语义链接。
     links = []
 
     # Lower ef_search for retain ANN — default 400 is tuned for recall precision
     # but at 164k units each HNSW probe takes 94ms. ef_search=60 gives 2.7ms/probe
     # (35x faster) with sufficient accuracy for top-50 semantic link creation.
     # Reset after to avoid polluting the connection pool for recall queries.
+    # 临时调低 HNSW 的 ef_search。
+    # 原理是: ef_search 越高，索引探测越深，召回更稳但单次查询更慢；
+    # retain 阶段只需要为新事实生成一批可用的 top_k 候选，因此更偏向吞吐量。
+    # 这里在会话级别设置，函数结束前必须 RESET，避免污染连接池里的其他查询。
     await conn.execute("SET hnsw.ef_search = 60")
 
     logger.debug(f"[ANN] Starting: {len(unit_ids)} seeds, top_k={top_k}")
 
     # Build per-unit fact_types (default to 'world' if not provided)
+    # 为每个待检索 unit 准备 fact_type。
+    # 这不是普通元数据，而是后续命中 partial HNSW index 的关键过滤条件。
+    # 未提供时统一按 world 处理，保持和现有 retain 默认事实类型一致。
     if fact_types is None:
         fact_types = ["world"] * len(unit_ids)
 
@@ -760,23 +771,44 @@ async def compute_semantic_links_ann(
     # sequential-scan every HNSW probe result against the array, destroying
     # performance (67s for 8k seeds). Self-links are harmless (ON CONFLICT DO
     # NOTHING handles duplicates in memory_links).
+    # 不额外传 exclude_uuids。
+    # 实践中，大量排除 ID 会让 PostgreSQL 在 ANN 结果外再做昂贵过滤，
+    # 从而破坏 HNSW 检索的收益。这里允许候选结果里出现自链接，
+    # 交给后续写入阶段的去重约束处理，总体性能更好。
     t_setup = time_mod.time()
+    # 用临时表把当前批次所有 seed 一次性送进数据库。
+    # 这样后面可以借助 LATERAL 子查询做批量 ANN，而不是 Python 逐条发 SQL。
     await conn.execute("CREATE TEMP TABLE IF NOT EXISTS _ann_seeds (unit_id text, emb_text text, fact_type text)")
+    # 复用临时表时先清空，防止上一次调用残留数据混入本轮结果。
     await conn.execute("TRUNCATE _ann_seeds")
 
+    # 把输入规整成 COPY 所需的记录集。
+    # emb_text 统一转成字符串，是为了在 SQL 中通过 ::vector 转成 pgvector 向量。
     records = [
         (uid, emb if isinstance(emb, str) else str(emb), ft) for uid, emb, ft in zip(unit_ids, embeddings, fact_types)
     ]
+    # COPY 比循环 INSERT 更适合大批量 seed 装载。
     await conn.copy_records_to_table("_ann_seeds", records=records, columns=["unit_id", "emb_text", "fact_type"])
     logger.debug(f"[ANN] Temp table setup: {time_mod.time() - t_setup:.3f}s ({len(records)} seeds)")
 
+    # 按 fact_type 分开查询。
+    # 这样每一批查询都能带上 mu.fact_type = $2，从而命中对应的 partial HNSW index；
+    # 如果混在一起查，优化器往往会退化成更慢的执行计划。
     # Run one ANN query per fact_type so each uses the right HNSW index.
     rows = []
+    # 只查询本轮真实出现过的类型，避免无效扫描。
     active_types = set(fact_types)
     for fact_type in active_types:
+        # 记录单个 fact_type 的查询耗时，用于观察是否某类事实明显更慢。
         t_query = time_mod.time()
+        # 统计当前类型对应的 seed 数量，主要服务于性能日志，不参与业务逻辑。
         seed_count = sum(1 for ft in fact_types if ft == fact_type)
         logger.debug(f"[ANN] Querying fact_type={fact_type}: {seed_count} seeds")
+        # 核心检索逻辑:
+        # 1. 外层从临时表读取当前 fact_type 下的全部 seed。
+        # 2. CROSS JOIN LATERAL 会对每个 seed 执行一次相关子查询。
+        # 3. 子查询在 memory_units 中按向量距离排序，取最接近的 top_k 条。
+        # 4. `<=>` 是 pgvector 距离运算符，`1 - distance` 转成相似度，便于统一阈值过滤。
         ft_rows = await conn.fetch(
             f"""
             SELECT s.unit_id       AS from_id,
@@ -798,27 +830,36 @@ async def compute_semantic_links_ann(
             bank_id,
             fact_type,
             top_k,
+            # 大 bank 上批量 ANN 可能耗时较长，因此显式放宽超时时间。
             timeout=300,  # ANN on large banks can take minutes
         )
         logger.debug(f"[ANN] fact_type={fact_type}: {len(ft_rows)} rows in {time_mod.time() - t_query:.3f}s")
+        # 把所有 fact_type 的候选结果汇总起来，后面统一做相似度阈值过滤。
         rows.extend(ft_rows)
 
     # Clean up temp table (no ON COMMIT DROP since we're not in a transaction)
+    # 显式删除临时表。
+    # 这里运行在独立连接上，不依赖事务提交自动清理，手动 DROP 更稳妥。
     await conn.execute("DROP TABLE IF EXISTS _ann_seeds")
 
     # Reset ef_search to default so the pooled connection doesn't affect recall queries
+    # 恢复默认 ef_search，避免这个连接回到连接池后影响其他高召回查询。
     await conn.execute("RESET hnsw.ef_search")
 
     for row in rows:
+        # 做一次边界钳制，防止浮点误差让相似度略微超出 [0, 1]。
         sim = float(min(1.0, max(0.0, row["similarity"])))
+        # 只保留达到阈值的候选，减少无效语义边写入。
         if sim >= threshold:
             links.append((row["from_id"], row["to_id"], "semantic", sim, None))
 
+    # 输出 ANN 阶段总耗时和有效链接数，便于观察 retain 的效果与成本。
     _log(
         log_buffer,
         f"      [8.1] ANN search (Phase 1): {len(unit_ids)} units → {len(links)} links in {time_mod.time() - ann_start:.3f}s",
     )
 
+    # 这里返回的 from_id 还是占位 ID，上游稍后会 remap 成真实插入后的 unit_id。
     return links
 
 

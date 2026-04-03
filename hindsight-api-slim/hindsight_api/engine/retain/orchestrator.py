@@ -147,7 +147,42 @@ async def _pre_resolve_phase1(
     # 把每条原始 content 上用户显式提供的实体，整理成以 content_index 为键的映射。
     # 后面的实体解析会把这些用户实体与 LLM 抽取到的实体合并处理。
     user_entities_per_content = {idx: content.entities for idx, content in enumerate(contents) if content.entities}
-
+    #  memory_units 是这个项目里“记忆事实的最小存储单元表”。
+    #
+    #   更准确地说，它不是原始 document，也不是 chunk，而是从内容里抽取出来的一条条“事实 / 记忆节点”。模型定义就在 /C:/Users/able2207008/公司/opensource/hindsight/hindsight-api-
+    #   slim/hindsight_api/models.py:81，注释写的是 Individual sentence-level memories.，核心字段包括：
+    #
+    #   - id：这条记忆单元自己的主键
+    #   - bank_id：属于哪个 bank
+    #   - document_id：来源于哪个 document
+    #   - chunk_id：来源于哪个 chunk
+    #   - text：这条事实的文本内容
+    #   - embedding：这条事实的向量
+    #   - fact_type：事实类型，比如 world、experience、opinion、observation
+    #   - 时间相关字段：event_date、occurred_start、occurred_end、mentioned_at
+    #   - 还有 metadata、tags、observation_scopes、text_signals 这类辅助检索/过滤信息
+    #
+    #   它在 retain 时是这样落库的：抽取完 facts 之后，批量 INSERT INTO memory_units (...)，见 /C:/Users/able2207008/公司/opensource/hindsight/hindsight-api-slim/hindsight_api/
+    #   engine/retain/fact_storage.py:111。
+    #
+    #   你可以把三层关系理解成：
+    #
+    #   - document：原始输入文档
+    #   - chunk：为了大文档处理而切出来的片段
+    #   - memory_unit：从 chunk 里提炼出的具体事实
+    #
+    #   举个例子：
+    #
+    #   原始 document:
+    #   "Alice 2024 年加入 OpenAI，现在负责检索系统。她上周在上海做了分享。"
+    #
+    #   可能切成 1 个 chunk，然后抽成 3 条 memory_units：
+    #
+    #   - Alice 在 2024 年加入 OpenAI
+    #   - Alice 负责检索系统
+    #   - Alice 上周在上海做了分享
+    #
+    #   后面检索、语义相似度、时间关联、实体关联，基本都是围绕 memory_units 做，而不是直接围绕 document 做。
     # Phase 1 还没有真正插入 memory_units，因此先用占位 unit_id 做分组键。
     # 后面 Phase 2 拿到真实 UUID 后，再统一 remap 回真实 unit_ids。
     # 这里的占位 unit_id 只是本批次内的临时编号，不会直接写入数据库。
